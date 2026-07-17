@@ -1,0 +1,5 @@
+[deploy]
+startCommand = "npm run start"
+healthcheckPath = "/api/boards"
+healthcheckTimeout = 30
+restartPolicyType = "ON_FAILURE"
