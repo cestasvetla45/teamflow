@@ -12,6 +12,7 @@ export interface TfMember {
   telegram_id: number | null
   telegram_username: string | null
   discord_id: string | null
+  discord_username: string | null
   email: string | null
   role: MemberRole
   status: MemberStatus

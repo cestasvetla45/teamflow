@@ -8,6 +8,7 @@ import { canAccessTopic, getTopicNameFromThread } from '@/lib/topic-access'
 import { DEFAULT_TOPICS, announceTopicAccessGranted, CHAT_HISTORY_VISIBILITY_INSTRUCTIONS } from '@/lib/telegram-topics'
 import { downloadTelegramFile } from '@/lib/telegram-files'
 import { extractFileContent } from '@/lib/file-reader'
+import { syncMembersToReelLab, formatVaSyncResult } from '@/lib/va-sync'
 import type { TfMember, TfSop, TfTask, TaskPriority, TfTeam } from '@/types/teamflow'
 import {
   ensureMemberExists,
@@ -152,6 +153,226 @@ interface AddTaskSession {
 // Single in-process draft per chat — fine for a small team bot on one long-running instance.
 const addTaskSessions = new Map<number, AddTaskSession>()
 
+// ---------------------------------------------------------------------------
+// Team assignment flow — "assign @member to <team>" in one shot, or a
+// conversational follow-up. State lives in-process like addTaskSessions, and
+// the text handler checks it BEFORE falling through to AI chat.
+// ---------------------------------------------------------------------------
+
+interface AssignSession {
+  step: 'awaiting_member' | 'awaiting_team'
+  teamName?: string
+  memberQuery?: string
+}
+
+const assignSessions = new Map<number, AssignSession>()
+
+const TEAM_PLATFORM_KEYWORDS: Record<string, string> = {
+  instagram: 'instagram',
+  twitter: 'twitter',
+  tiktok: 'tiktok',
+  reddit: 'reddit',
+  youtube: 'youtube',
+}
+
+/**
+ * Resolves free-text input (or a Telegram mention) to a member.
+ * text_mention entities carry the sender-picked user's telegram id directly —
+ * when we match one to a member, we also backfill their telegram_id.
+ */
+async function resolveMemberInput(ctx: Context, input: string): Promise<TfMember | null> {
+  const message = ctx.message
+  if (message && 'entities' in message) {
+    for (const e of message.entities ?? []) {
+      if (e.type === 'text_mention' && e.user) {
+        const byId = await getMemberByTelegramId(supabase, e.user.id)
+        if (byId) return byId
+        const { data } = await supabase
+          .from('tf_members')
+          .select('*')
+          .ilike('name', `%${e.user.first_name}%`)
+          .maybeSingle()
+        if (data) {
+          await supabase
+            .from('tf_members')
+            .update({ telegram_id: e.user.id, telegram_username: e.user.username ?? (data as TfMember).telegram_username })
+            .eq('id', (data as TfMember).id)
+          return { ...(data as TfMember), telegram_id: e.user.id }
+        }
+      }
+    }
+  }
+
+  const handle = input.trim().replace(/^@/, '').replace(/[.,!?]+$/, '')
+  if (!handle) return null
+
+  const byUsername = await getMemberByUsername(supabase, handle)
+  if (byUsername) return byUsername
+
+  const { data: exact } = await supabase.from('tf_members').select('*').ilike('name', handle).maybeSingle()
+  if (exact) return exact as TfMember
+
+  const { data: fuzzy } = await supabase.from('tf_members').select('*').ilike('name', `%${handle}%`).limit(2)
+  const matches = (fuzzy as TfMember[]) ?? []
+  return matches.length === 1 ? matches[0] : null
+}
+
+async function resolveTeamInput(input: string): Promise<TfTeam | null> {
+  const clean = input.trim().replace(/^the\s+/i, '').replace(/\s+(team|role)$/i, '').trim()
+  if (!clean) return null
+
+  const { data: exact } = await supabase.from('tf_teams').select('*').ilike('name', clean).maybeSingle()
+  if (exact) return exact as TfTeam
+
+  const { data: fuzzy } = await supabase.from('tf_teams').select('*').ilike('name', `%${clean}%`).limit(2)
+  const matches = (fuzzy as TfTeam[]) ?? []
+  return matches.length === 1 ? matches[0] : null
+}
+
+/** Adds the member to the team, auto-grants the platform topic (mirrors the AI tool), and replies. */
+async function assignMemberToTeam(ctx: Context, member: TfMember, team: TfTeam): Promise<void> {
+  const { error } = await supabase.from('tf_member_teams').insert({ member_id: member.id, team_id: team.id })
+  if (error && error.code !== '23505') {
+    await reply(ctx, `Failed to assign: ${error.message}`)
+    return
+  }
+  const alreadyOnTeam = error?.code === '23505'
+
+  let topicNote = ''
+  const teamLower = team.name.toLowerCase()
+  for (const [keyword, topicName] of Object.entries(TEAM_PLATFORM_KEYWORDS)) {
+    if (teamLower.includes(keyword)) {
+      await supabase
+        .from('tf_topic_team_access')
+        .upsert({ topic_name: topicName, team_id: team.id }, { onConflict: 'topic_name,team_id' })
+      topicNote = ` The team has access to the ${topicName} topic.`
+      break
+    }
+  }
+
+  assignSessions.delete(ctx.chat!.id)
+  await reply(
+    ctx,
+    alreadyOnTeam
+      ? `${member.name} is already on the "${team.name}" team.${topicNote}`
+      : `✅ Assigned ${member.name} to the "${team.name}" team.${topicNote}`
+  )
+}
+
+/**
+ * One-shot assignment intent detection: "assign @matuseno to Instagram VA",
+ * "assign @matuseno the Instagram VA role", "add Adam to the Twitter VA team".
+ * Returns true when the message was handled (so it must NOT fall through to AI).
+ */
+async function tryHandleAssignIntent(ctx: Context, text: string): Promise<boolean> {
+  if (!/\b(assign|add|put|move|give)\b/i.test(text)) return false
+  const mentionsTeamWord = /\b(team|role)\b/i.test(text)
+
+  const { data } = await supabase.from('tf_teams').select('*')
+  // Longest name first so "Instagram VA" wins over a hypothetical "VA" team.
+  const teams = ((data as TfTeam[]) ?? []).sort((a, b) => b.name.length - a.name.length)
+  const lower = text.toLowerCase()
+  const team = teams.find((t) => lower.includes(t.name.toLowerCase())) ?? null
+
+  if (!team && !mentionsTeamWord) return false
+
+  // Member: prefer an @mention (ignoring the bot's own), else the words
+  // between the verb and the team name.
+  let memberQuery: string | null = null
+  const mentionRegex = /@([A-Za-z0-9_.]{2,32})/g
+  let mentionMatch: RegExpExecArray | null
+  while ((mentionMatch = mentionRegex.exec(text)) !== null) {
+    if (mentionMatch[1].toLowerCase() !== BOT_USERNAME.toLowerCase()) {
+      memberQuery = mentionMatch[1]
+      break
+    }
+  }
+  if (!memberQuery && team) {
+    const afterVerb = text.match(/\b(?:assign|add|put|move|give)\s+(.*)/i)?.[1] ?? ''
+    const teamIdx = afterVerb.toLowerCase().indexOf(team.name.toLowerCase())
+    const candidate = (teamIdx >= 0 ? afterVerb.slice(0, teamIdx) : afterVerb)
+      .replace(/\b(to|as|into|onto|on|the)\b/gi, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/[.,!?]+$/, '')
+    if (candidate) memberQuery = candidate
+  }
+
+  if (team && memberQuery) {
+    const member = await resolveMemberInput(ctx, memberQuery)
+    if (!member) {
+      assignSessions.set(ctx.chat!.id, { step: 'awaiting_member', teamName: team.name })
+      await reply(
+        ctx,
+        `I couldn't find a member matching "${memberQuery}". Who should join the "${team.name}" team? Send their name or @username (or /cancel).`
+      )
+      return true
+    }
+    await assignMemberToTeam(ctx, member, team)
+    return true
+  }
+
+  if (team) {
+    assignSessions.set(ctx.chat!.id, { step: 'awaiting_member', teamName: team.name })
+    await reply(ctx, `Who should be assigned to the "${team.name}" team? Send their name or @username (or /cancel).`)
+    return true
+  }
+
+  if (memberQuery) {
+    if (teams.length === 0) {
+      await reply(ctx, 'No teams exist yet. Create one with /addteam <name>.')
+      return true
+    }
+    assignSessions.set(ctx.chat!.id, { step: 'awaiting_team', memberQuery })
+    const buttons = teams.map((t) => [Markup.button.callback(t.name, `assignteam:${t.id}`)])
+    await reply(ctx, `Which team should ${memberQuery} join?`, Markup.inlineKeyboard(buttons))
+    return true
+  }
+
+  return false
+}
+
+/** Handles the follow-up message of an active assignment session. Returns true when consumed. */
+async function handleAssignSessionReply(ctx: Context, text: string): Promise<boolean> {
+  const chatId = ctx.chat?.id
+  if (!chatId) return false
+  const session = assignSessions.get(chatId)
+  if (!session) return false
+  // Assignment is admin-only — don't let another group member hijack the flow.
+  if (!isAdminTelegramId(ctx.from?.id)) return false
+
+  if (session.step === 'awaiting_member') {
+    const member = await resolveMemberInput(ctx, text)
+    if (!member) {
+      await reply(ctx, `I couldn't find a member matching "${text}". Try their exact name or @username, or /cancel.`)
+      return true
+    }
+    const team = await resolveTeamInput(session.teamName!)
+    if (!team) {
+      assignSessions.delete(chatId)
+      await reply(ctx, `The "${session.teamName}" team no longer exists. Start again.`)
+      return true
+    }
+    await assignMemberToTeam(ctx, member, team)
+    return true
+  }
+
+  // awaiting_team
+  const team = await resolveTeamInput(text)
+  if (!team) {
+    await reply(ctx, `I couldn't find a team matching "${text}". Send /teams to see the list, or /cancel.`)
+    return true
+  }
+  const member = await resolveMemberInput(ctx, session.memberQuery!)
+  if (!member) {
+    assignSessions.delete(chatId)
+    await reply(ctx, `I couldn't find a member matching "${session.memberQuery}". Start again with "assign @username to ${team.name}".`)
+    return true
+  }
+  await assignMemberToTeam(ctx, member, team)
+  return true
+}
+
 function commandArgs(text: string | undefined): string {
   if (!text) return ''
   const spaceIdx = text.indexOf(' ')
@@ -267,6 +488,8 @@ const HELP_TEXT = `<b>TeamFlow Bot commands</b>
 /sops — list all Standard Operating Procedures
 /sop &lt;name&gt; — view a specific SOP
 /syncsops — sync all SOPs to the Telegram SOPs topic (admin only)
+/syncva — sync members to Reel Lab's VA system (admin only)
+/syncids — list members missing a Telegram ID (admin only)
 /mine — your own tasks
 /mytasks — your own tasks, grouped by status
 /done &lt;id&gt; — mark your own task as complete
@@ -330,7 +553,39 @@ bot.command('help', async (ctx) => {
 
 bot.command('cancel', async (ctx) => {
   addTaskSessions.delete(ctx.chat.id)
+  assignSessions.delete(ctx.chat.id)
   await reply(ctx, 'Cancelled.')
+})
+
+// Inline keyboard from the "which team?" step of the assignment flow.
+bot.action(/^assignteam:(.+)$/, async (ctx) => {
+  const session = assignSessions.get(ctx.chat!.id)
+  if (!session || session.step !== 'awaiting_team') {
+    await ctx.answerCbQuery('This flow has expired.')
+    return
+  }
+
+  const { data: team } = await supabase.from('tf_teams').select('*').eq('id', ctx.match[1]).maybeSingle()
+  if (!team) {
+    await ctx.answerCbQuery('Team not found.')
+    return
+  }
+  await ctx.answerCbQuery()
+
+  const member = await resolveMemberInput(ctx, session.memberQuery!)
+  if (!member) {
+    const missing = session.memberQuery
+    session.step = 'awaiting_member'
+    session.teamName = (team as TfTeam).name
+    session.memberQuery = undefined
+    await ctx.editMessageText(
+      `I couldn't find a member matching "${missing}". Send their name or @username (or /cancel).`
+    )
+    return
+  }
+
+  await ctx.editMessageText(`Assigning ${member.name} to "${(team as TfTeam).name}"…`)
+  await assignMemberToTeam(ctx, member, team as TfTeam)
 })
 
 // ---------------------------------------------------------------------------
@@ -1400,6 +1655,54 @@ bot.command('syncsops', async (ctx) => {
 })
 
 // ---------------------------------------------------------------------------
+// /syncva — sync TeamFlow members into Reel Lab's va_profiles + telegram_users
+// ---------------------------------------------------------------------------
+
+bot.command('syncva', async (ctx) => {
+  if (!(await requireAdmin(ctx))) return
+
+  await reply(ctx, '🔄 Syncing TeamFlow members to Reel Lab…')
+  try {
+    const result = await syncMembersToReelLab(supabase)
+    await reply(ctx, formatVaSyncResult(result))
+  } catch (err) {
+    await reply(ctx, `❌ Sync failed: ${err instanceof Error ? err.message : String(err)}`)
+  }
+})
+
+// ---------------------------------------------------------------------------
+// /syncids — list members missing a telegram_id and ask them to identify
+// ---------------------------------------------------------------------------
+
+bot.command('syncids', async (ctx) => {
+  if (!(await requireAdmin(ctx))) return
+
+  const { data } = await supabase
+    .from('tf_members')
+    .select('*')
+    .eq('status', 'active')
+    .is('telegram_id', null)
+
+  const missing = (data as TfMember[]) ?? []
+  if (missing.length === 0) {
+    await reply(ctx, '✅ All active members already have a Telegram ID linked.')
+    return
+  }
+
+  const list = missing
+    .map((m) => `  • ${m.name}${m.telegram_username ? ` (@${m.telegram_username})` : ''}`)
+    .join('\n')
+
+  await reply(
+    ctx,
+    `🪪 ${missing.length} member${missing.length === 1 ? '' : 's'} missing a Telegram ID:\n${list}\n\n` +
+      `📣 If you're on this list: send /start to @${BOT_USERNAME} in a private chat (or just reply to me here). ` +
+      `Your ID is linked automatically from your first message, matched by your @username. ` +
+      `Then the admin can run /syncva to push everyone to Reel Lab.`
+  )
+})
+
+// ---------------------------------------------------------------------------
 // VA Daily To-Do — pulls from Reel Lab's shared Supabase tables
 // ---------------------------------------------------------------------------
 
@@ -1471,6 +1774,14 @@ bot.on('text', async (ctx) => {
     await finalizeAddTask(ctx, session, text)
     return
   }
+
+  // Active assignment flow — must run BEFORE AI chat so the follow-up answer
+  // ("@matuseno") completes the assignment instead of hitting the AI.
+  if (await handleAssignSessionReply(ctx, text)) return
+
+  // One-shot assignment: "assign @matuseno to Instagram VA" (admin only —
+  // non-admins fall through to the AI, which explains the restriction).
+  if (isAdminTelegramId(ctx.from.id) && (await tryHandleAssignIntent(ctx, text))) return
 
   const sender = await getMemberByTelegramId(supabase, ctx.from.id)
   const admin = isAdminTelegramId(ctx.from.id)

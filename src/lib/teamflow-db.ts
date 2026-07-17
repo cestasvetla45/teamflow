@@ -64,7 +64,19 @@ export async function ensureMemberExists(
   params: { telegram_id: number; telegram_username?: string | null; name: string }
 ): Promise<TfMember> {
   const byTelegramId = await getMemberByTelegramId(supabase, params.telegram_id)
-  if (byTelegramId) return byTelegramId
+  if (byTelegramId) {
+    // Keep the stored username fresh — it's the join key for /syncva and mentions.
+    if (params.telegram_username && byTelegramId.telegram_username !== params.telegram_username) {
+      const { data } = await supabase
+        .from('tf_members')
+        .update({ telegram_username: params.telegram_username })
+        .eq('id', byTelegramId.id)
+        .select('*')
+        .single()
+      if (data) return data as TfMember
+    }
+    return byTelegramId
+  }
 
   // Member may already exist from /addmember (which only records a username, not a telegram_id yet).
   // Link the two instead of creating a duplicate row.
@@ -93,6 +105,50 @@ export async function ensureMemberExists(
     .single()
 
   if (error || !data) throw new Error(`Failed to auto-register member: ${error?.message}`)
+  return data as TfMember
+}
+
+export async function getMemberByDiscordId(
+  supabase: AdminClient,
+  discordId: string
+): Promise<TfMember | null> {
+  const { data } = await supabase
+    .from('tf_members')
+    .select('*')
+    .eq('discord_id', discordId)
+    .maybeSingle()
+  return (data as TfMember) ?? null
+}
+
+export async function ensureDiscordMemberExists(
+  supabase: AdminClient,
+  params: { discord_id: string; name: string; discord_username?: string }
+): Promise<TfMember> {
+  const existing = await getMemberByDiscordId(supabase, params.discord_id)
+  if (existing) {
+    if (params.discord_username && existing.discord_username !== params.discord_username) {
+      const { data, error } = await supabase
+        .from('tf_members')
+        .update({ discord_username: params.discord_username, name: params.name })
+        .eq('id', existing.id)
+        .select('*')
+        .single()
+      if (!error && data) return data as TfMember
+    }
+    return existing
+  }
+
+  const { data, error } = await supabase
+    .from('tf_members')
+    .insert({
+      discord_id: params.discord_id,
+      name: params.name,
+      discord_username: params.discord_username ?? null,
+    })
+    .select('*')
+    .single()
+
+  if (error || !data) throw new Error(`Failed to auto-register Discord member: ${error?.message}`)
   return data as TfMember
 }
 

@@ -1,4 +1,5 @@
 import { createAdminClient } from '@/lib/supabase/admin'
+import type { TfMember } from '@/types/teamflow'
 
 const supabase = createAdminClient()
 
@@ -26,22 +27,21 @@ export async function getTopicNameFromThread(threadId: number): Promise<string |
   return data?.topic_name ?? null
 }
 
-// Check if a member can access a topic
-export async function canAccessTopic(
-  memberTelegramId: number,
+// Get the topic name from a Discord channel id
+export async function getTopicNameFromDiscordChannel(channelId: string): Promise<string | null> {
+  const { data } = await supabase
+    .from('tf_telegram_topics')
+    .select('topic_name')
+    .eq('discord_channel_id', channelId)
+    .maybeSingle()
+  return data?.topic_name ?? null
+}
+
+// Shared role/team access check — used by both the Telegram and Discord lookups below
+async function canMemberAccessTopic(
+  member: TfMember,
   topicName: string
 ): Promise<{ allowed: boolean; reason?: string }> {
-  // Get the member
-  const { data: member } = await supabase
-    .from('tf_members')
-    .select('*')
-    .eq('telegram_id', memberTelegramId)
-    .maybeSingle()
-
-  if (!member) {
-    return { allowed: false, reason: UNAUTHORIZED_TOPIC_MESSAGE }
-  }
-
   // Admins can access everything
   if (member.role === 'admin') return { allowed: true }
 
@@ -85,4 +85,40 @@ export async function canAccessTopic(
   if (teamAccess && teamAccess.length > 0) return { allowed: true }
 
   return { allowed: false, reason: UNAUTHORIZED_TOPIC_MESSAGE }
+}
+
+// Check if a member can access a topic (Telegram sender)
+export async function canAccessTopic(
+  memberTelegramId: number,
+  topicName: string
+): Promise<{ allowed: boolean; reason?: string }> {
+  const { data: member } = await supabase
+    .from('tf_members')
+    .select('*')
+    .eq('telegram_id', memberTelegramId)
+    .maybeSingle()
+
+  if (!member) {
+    return { allowed: false, reason: UNAUTHORIZED_TOPIC_MESSAGE }
+  }
+
+  return canMemberAccessTopic(member as TfMember, topicName)
+}
+
+// Check if a member can access a topic (Discord sender)
+export async function canAccessTopicForDiscordUser(
+  discordId: string,
+  topicName: string
+): Promise<{ allowed: boolean; reason?: string }> {
+  const { data: member } = await supabase
+    .from('tf_members')
+    .select('*')
+    .eq('discord_id', discordId)
+    .maybeSingle()
+
+  if (!member) {
+    return { allowed: false, reason: UNAUTHORIZED_TOPIC_MESSAGE }
+  }
+
+  return canMemberAccessTopic(member as TfMember, topicName)
 }

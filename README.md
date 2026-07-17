@@ -104,6 +104,7 @@ Team task management platform with Trello-like board, Telegram bot with AI, VA m
 - [x] 📢 Notifications topic in group for task completions
 - [x] Cron endpoint for overdue task alerts
 - [x] Cron endpoint for daily summary
+- [x] Cron endpoint for 4-hour alert checks (overdue, unassigned, workload, stale, activity)
 
 ### 📋 SOP Management
 - [x] Create, edit, archive SOPs
@@ -203,4 +204,22 @@ After deploy, re-register the Telegram webhook:
 ```bash
 curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/deleteWebhook"
 curl -s "https://api.telegram.org/bot$TELEGRAM_BOT_TOKEN/setWebhook?url=https://teamflow-production-4292.up.railway.app/api/telegram/webhook&drop_pending_updates=true"
+```
+
+## Cron: 4-Hour Alert Checks
+
+`GET /api/cron/alerts` runs five checks (overdue, unassigned, overloaded/near-capacity members, stale in-progress tasks, no recent activity) and posts the result to both Discord #notifications and the Telegram notifications topic. Protected by `Authorization: Bearer $CRON_SECRET`. Silent when the board has no tasks at all; sends an "All good" summary when tasks exist but nothing needs attention.
+
+Railway's cron scheduling only works for services that run and exit — it can't hit an HTTP endpoint on an always-on service like this one. Use an external scheduler instead:
+
+**cron-job.org (recommended, free):**
+1. Create a new cron job
+2. URL: `https://teamflow-production-4292.up.railway.app/api/cron/alerts`
+3. Schedule: every 4 hours (`0 */4 * * *`)
+4. Method: GET
+5. Add header: `Authorization: Bearer <CRON_SECRET value>`
+
+Test manually:
+```bash
+curl -s -H "Authorization: Bearer $CRON_SECRET" https://teamflow-production-4292.up.railway.app/api/cron/alerts
 ```

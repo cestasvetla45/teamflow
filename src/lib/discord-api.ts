@@ -104,6 +104,13 @@ export async function setChannelPermission(
   await discordCall('PUT', `/channels/${channelId}/permissions/${overwriteId}`, { type, allow, deny })
 }
 
+// DMs are sent through a DM channel owned by the bot — the API is
+// POST /users/@me/channels with the recipient's id (not /users/{id}/channels).
+// Discord returns the existing DM channel if one is already open.
+export async function createDmChannel(userId: string): Promise<DiscordChannel> {
+  return discordCall<DiscordChannel>('POST', '/users/@me/channels', { recipient_id: userId })
+}
+
 export async function sendMessage(
   channelId: string,
   content: string,

@@ -1,5 +1,3 @@
 [deploy]
-startCommand = "npm run start"
-healthcheckPath = "/api/boards"
-healthcheckTimeout = 30
+startCommand = "./start.sh"
 restartPolicyType = "ON_FAILURE"
