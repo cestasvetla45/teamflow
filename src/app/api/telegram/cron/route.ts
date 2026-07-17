@@ -3,6 +3,7 @@ import { bot } from '@/lib/bot'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { formatDueDate, isOverdue, logActivity } from '@/lib/teamflow-db'
 import { sendToTopic } from '@/lib/telegram-topics'
+import { notifyDiscord, notifyDiscordChannel } from '@/lib/discord-notify'
 import type { TfMember, TfTask } from '@/types/teamflow'
 
 export const runtime = 'nodejs'
@@ -96,7 +97,11 @@ async function checkOverdueTasks(supabase: ReturnType<typeof createAdminClient>)
 
     const topicMessage = `⚠️ Task "${task.title}" assigned to ${assigneeLabel} is overdue (was due ${dueDescription}).`
     await sendToTopic('notifications', topicMessage)
-    if (task.platform) await sendToTopic(task.platform, topicMessage)
+    await notifyDiscord(topicMessage)
+    if (task.platform) {
+      await sendToTopic(task.platform, topicMessage)
+      await notifyDiscordChannel(task.platform, topicMessage)
+    }
 
     await logActivity(supabase, {
       taskId: task.id,
@@ -158,6 +163,7 @@ async function sendDailySummary(supabase: ReturnType<typeof createAdminClient>) 
   ].join('\n')
 
   await sendToTopic('notifications', message)
+  await notifyDiscord(message)
 
   try {
     await bot.telegram.sendMessage(Number(adminId), message)

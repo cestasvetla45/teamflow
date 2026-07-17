@@ -1,5 +1,7 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import { editTopicMessage, sendToTopic } from '@/lib/telegram-topics'
+import { getDiscordChannelId } from '@/lib/discord-notify'
+import { sendMessage as sendDiscordMessage, editMessage as editDiscordMessage } from '@/lib/discord-api'
 import type { Platform, SopCategory, TfSop, TfSopVersion } from '@/types/teamflow'
 
 const supabase = createAdminClient()
@@ -193,5 +195,34 @@ export async function syncSOPToTelegram(sopId: string): Promise<void> {
   const messageId = await sendToTopic('sops', message)
   if (messageId) {
     await supabase.from('tf_sops').update({ telegram_message_id: messageId }).eq('id', sopId)
+  }
+}
+
+const DISCORD_SOP_PLATFORMS = new Set(['twitter', 'instagram', 'tiktok', 'youtube'])
+
+export async function syncSOPToDiscord(sopId: string): Promise<void> {
+  const { data: sop, error } = await supabase.from('tf_sops').select('*').eq('id', sopId).single()
+  if (error || !sop) throw new Error(`SOP not found: ${error?.message}`)
+
+  const topicName = sop.platform && DISCORD_SOP_PLATFORMS.has(sop.platform) ? `sop_${sop.platform}` : 'sop_general'
+  const channelId = await getDiscordChannelId(topicName)
+  if (!channelId) return
+
+  const message = formatSOPMessage(sop as TfSop)
+
+  if (sop.discord_message_id) {
+    try {
+      await editDiscordMessage(channelId, sop.discord_message_id, message)
+      return
+    } catch (err) {
+      console.error('Failed to edit Discord SOP message, posting a new one instead:', err)
+    }
+  }
+
+  try {
+    const sent = await sendDiscordMessage(channelId, message)
+    await supabase.from('tf_sops').update({ discord_message_id: sent.id }).eq('id', sopId)
+  } catch (err) {
+    console.error('Failed to post SOP to Discord:', err)
   }
 }

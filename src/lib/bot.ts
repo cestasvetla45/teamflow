@@ -2,9 +2,10 @@ import { Telegraf, Markup, Context } from 'telegraf'
 import { createAdminClient } from '@/lib/supabase/admin'
 import { generateAIResponse, generateAIResponseWithFile } from '@/lib/bot-ai'
 import { getMemberWorkload } from '@/lib/workload'
-import { listSOPs, syncSOPToTelegram } from '@/lib/sops'
+import { listSOPs, syncSOPToTelegram, syncSOPToDiscord } from '@/lib/sops'
+import { getVATodoMessage } from '@/lib/va-todo'
 import { canAccessTopic, getTopicNameFromThread } from '@/lib/topic-access'
-import { DEFAULT_TOPICS } from '@/lib/telegram-topics'
+import { DEFAULT_TOPICS, announceTopicAccessGranted, CHAT_HISTORY_VISIBILITY_INSTRUCTIONS } from '@/lib/telegram-topics'
 import { downloadTelegramFile } from '@/lib/telegram-files'
 import { extractFileContent } from '@/lib/file-reader'
 import type { TfMember, TfSop, TfTask, TaskPriority, TfTeam } from '@/types/teamflow'
@@ -273,6 +274,7 @@ const HELP_TEXT = `<b>TeamFlow Bot commands</b>
 /pause &lt;id&gt; — pause your own task (move back to To Do)
 /mydone — your completed tasks (last 7 days)
 /myworkload — your own workload
+/vatodo [@handle] — VA daily checklist from Reel Lab (Instagram accounts)
 /cancel — cancel the current /addtask flow
 /help — show this message
 
@@ -317,7 +319,7 @@ bot.start(async (ctx) => {
   }
 
   await reply(ctx,
-    `👋 Welcome to <b>TeamFlow Bot</b>!\n\nI help manage tasks and team workload for this group.\n\n${HELP_TEXT}`,
+    `👋 Welcome to <b>TeamFlow Bot</b>!\n\nI help manage tasks and team workload for this group.\n\n${HELP_TEXT}\n\n${CHAT_HISTORY_VISIBILITY_INSTRUCTIONS}`,
     { parse_mode: 'HTML' }
   )
 })
@@ -1000,6 +1002,7 @@ bot.command('granttopic', async (ctx) => {
     return
   }
 
+  await announceTopicAccessGranted(topicName, (team as TfTeam).name)
   await reply(ctx, `✅ Team "${(team as TfTeam).name}" now has access to the ${topic.title} topic.`)
 })
 
@@ -1386,9 +1389,27 @@ bot.command('syncsops', async (ctx) => {
     } catch (err) {
       console.error(`Failed to sync SOP ${sop.id}:`, err)
     }
+    try {
+      await syncSOPToDiscord(sop.id)
+    } catch (err) {
+      console.error(`Failed to sync SOP ${sop.id} to Discord:`, err)
+    }
   }
 
   await reply(ctx, `✅ Synced ${synced}/${sops.length} SOPs to the #sops topic.`)
+})
+
+// ---------------------------------------------------------------------------
+// VA Daily To-Do — pulls from Reel Lab's shared Supabase tables
+// ---------------------------------------------------------------------------
+
+bot.command('vatodo', async (ctx) => {
+  const text = ctx.message?.text || ''
+  const parts = text.split(/\s+/)
+  const accountHandle = parts[1]?.replace(/^@/, '')
+  
+  const msg = await getVATodoMessage(accountHandle)
+  await reply(ctx, msg, { parse_mode: 'HTML' })
 })
 
 // ---------------------------------------------------------------------------

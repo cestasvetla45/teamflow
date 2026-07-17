@@ -63,7 +63,7 @@ export async function createForumTopics(chatId: number): Promise<{ name: string;
 
 export async function getTopicThread(
   topicName: string
-): Promise<{ chat_id: number; message_thread_id: number | null } | null> {
+): Promise<{ chat_id: number | null; message_thread_id: number | null } | null> {
   const { data } = await supabase
     .from('tf_telegram_topics')
     .select('chat_id, message_thread_id')
@@ -79,7 +79,7 @@ export async function sendToTopic(
   parseMode?: 'HTML' | 'Markdown' | 'MarkdownV2'
 ): Promise<number | null> {
   const topic = await getTopicThread(topicName)
-  if (!topic) {
+  if (!topic || topic.chat_id == null) {
     console.error(`No Telegram topic configured for "${topicName}". Run /api/telegram/setup-topics first.`)
     return null
   }
@@ -98,6 +98,30 @@ export async function sendToTopic(
   }
 }
 
+// Posted to a topic whenever a team is granted access, so its members know to
+// scroll up and read the topic's history.
+export async function announceTopicAccessGranted(topicName: string, teamName: string): Promise<void> {
+  await sendToTopic(topicName, `🔓 Access granted: ${teamName} can now see this topic's history and post here.`)
+}
+
+/**
+ * The Bot API has no method to control "Chat history for new members" — that's a
+ * supergroup-level setting (MTProto: togglePreHistoryHidden) only exposed through
+ * the Telegram client apps, not to bots. `setChatPermissions` only controls default
+ * member permissions (sending messages/media/etc.), not history visibility, so it
+ * can't be used as a substitute.
+ *
+ * Manual step required once per group, by a human admin:
+ *   Group → Edit → Chat History for New Members → Visible
+ *
+ * Until that's set, members who are newly granted topic access won't be able to
+ * scroll up past the point they joined — announceTopicAccessGranted() above is the
+ * best we can do from the bot side.
+ */
+export const CHAT_HISTORY_VISIBILITY_INSTRUCTIONS =
+  'ℹ️ One-time manual setup: in the group, go to Edit → Chat History for New Members → Visible. ' +
+  "This lets newly-added team members read a topic's past messages (the Bot API has no method for this)."
+
 export async function editTopicMessage(
   topicName: string,
   messageId: number,
@@ -105,7 +129,7 @@ export async function editTopicMessage(
   parseMode?: 'HTML' | 'Markdown' | 'MarkdownV2'
 ): Promise<boolean> {
   const topic = await getTopicThread(topicName)
-  if (!topic) return false
+  if (!topic || topic.chat_id == null) return false
 
   try {
     await callTelegramApi('editMessageText', {

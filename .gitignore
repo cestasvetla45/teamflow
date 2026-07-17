@@ -2,3 +2,5 @@
 node_modules/
 .next/
 /tmp/
+*.md
+!README.md

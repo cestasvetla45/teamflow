@@ -1025,10 +1025,14 @@ export type Database = {
           handle: string
           id: string
           is_active: boolean | null
+          is_rising: boolean | null
+          last_scraped_at: string | null
+          last_viral_at: string | null
           niche: string | null
           posts_count: number | null
           profile_pic_url: string | null
           profile_url: string | null
+          scrape_status: string | null
           sub_category: string | null
           tray: string | null
           updated_at: string | null
@@ -1043,10 +1047,14 @@ export type Database = {
           handle: string
           id?: string
           is_active?: boolean | null
+          is_rising?: boolean | null
+          last_scraped_at?: string | null
+          last_viral_at?: string | null
           niche?: string | null
           posts_count?: number | null
           profile_pic_url?: string | null
           profile_url?: string | null
+          scrape_status?: string | null
           sub_category?: string | null
           tray?: string | null
           updated_at?: string | null
@@ -1061,10 +1069,14 @@ export type Database = {
           handle?: string
           id?: string
           is_active?: boolean | null
+          is_rising?: boolean | null
+          last_scraped_at?: string | null
+          last_viral_at?: string | null
           niche?: string | null
           posts_count?: number | null
           profile_pic_url?: string | null
           profile_url?: string | null
+          scrape_status?: string | null
           sub_category?: string | null
           tray?: string | null
           updated_at?: string | null
@@ -1826,11 +1838,13 @@ export type Database = {
           following: number | null
           handle: string
           id: string
+          last_scraped_at: string | null
           niche: string | null
           notes: string | null
           posts_count: number | null
           profile_pic_url: string | null
           profile_url: string | null
+          scrape_status: string | null
           subniche: string | null
           updated_at: string | null
           va_group: string | null
@@ -1842,11 +1856,13 @@ export type Database = {
           following?: number | null
           handle: string
           id?: string
+          last_scraped_at?: string | null
           niche?: string | null
           notes?: string | null
           posts_count?: number | null
           profile_pic_url?: string | null
           profile_url?: string | null
+          scrape_status?: string | null
           subniche?: string | null
           updated_at?: string | null
           va_group?: string | null
@@ -1858,11 +1874,13 @@ export type Database = {
           following?: number | null
           handle?: string
           id?: string
+          last_scraped_at?: string | null
           niche?: string | null
           notes?: string | null
           posts_count?: number | null
           profile_pic_url?: string | null
           profile_url?: string | null
+          scrape_status?: string | null
           subniche?: string | null
           updated_at?: string | null
           va_group?: string | null
@@ -2312,10 +2330,47 @@ export type Database = {
           },
         ]
       }
+      tf_member_teams: {
+        Row: {
+          created_at: string | null
+          id: string
+          member_id: string
+          team_id: string
+        }
+        Insert: {
+          created_at?: string | null
+          id?: string
+          member_id: string
+          team_id: string
+        }
+        Update: {
+          created_at?: string | null
+          id?: string
+          member_id?: string
+          team_id?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "tf_member_teams_member_id_fkey"
+            columns: ["member_id"]
+            isOneToOne: false
+            referencedRelation: "tf_members"
+            referencedColumns: ["id"]
+          },
+          {
+            foreignKeyName: "tf_member_teams_team_id_fkey"
+            columns: ["team_id"]
+            isOneToOne: false
+            referencedRelation: "tf_teams"
+            referencedColumns: ["id"]
+          },
+        ]
+      }
       tf_members: {
         Row: {
           avatar_url: string | null
           created_at: string | null
+          discord_id: string | null
           email: string | null
           id: string
           max_daily_hours: number | null
@@ -2330,6 +2385,7 @@ export type Database = {
         Insert: {
           avatar_url?: string | null
           created_at?: string | null
+          discord_id?: string | null
           email?: string | null
           id?: string
           max_daily_hours?: number | null
@@ -2344,6 +2400,7 @@ export type Database = {
         Update: {
           avatar_url?: string | null
           created_at?: string | null
+          discord_id?: string | null
           email?: string | null
           id?: string
           max_daily_hours?: number | null
@@ -2435,6 +2492,7 @@ export type Database = {
           content: string
           created_at: string | null
           created_by: string | null
+          discord_message_id: string | null
           id: string
           platform: string | null
           status: string | null
@@ -2449,6 +2507,7 @@ export type Database = {
           content: string
           created_at?: string | null
           created_by?: string | null
+          discord_message_id?: string | null
           id?: string
           platform?: string | null
           status?: string | null
@@ -2463,6 +2522,7 @@ export type Database = {
           content?: string
           created_at?: string | null
           created_by?: string | null
+          discord_message_id?: string | null
           id?: string
           platform?: string | null
           status?: string | null
@@ -2612,32 +2672,115 @@ export type Database = {
           },
         ]
       }
-      tf_telegram_topics: {
+      tf_teams: {
         Row: {
-          chat_id: number
           created_at: string | null
           description: string | null
+          discord_role_id: string | null
+          id: string
+          name: string
+        }
+        Insert: {
+          created_at?: string | null
+          description?: string | null
+          discord_role_id?: string | null
+          id?: string
+          name: string
+        }
+        Update: {
+          created_at?: string | null
+          description?: string | null
+          discord_role_id?: string | null
+          id?: string
+          name?: string
+        }
+        Relationships: []
+      }
+      tf_telegram_topics: {
+        Row: {
+          chat_id: number | null
+          created_at: string | null
+          description: string | null
+          discord_channel_id: string | null
+          discord_guild_id: string | null
           id: string
           message_thread_id: number | null
           topic_name: string
         }
         Insert: {
-          chat_id: number
+          chat_id?: number | null
           created_at?: string | null
           description?: string | null
+          discord_channel_id?: string | null
+          discord_guild_id?: string | null
           id?: string
           message_thread_id?: number | null
           topic_name: string
         }
         Update: {
-          chat_id?: number
+          chat_id?: number | null
           created_at?: string | null
           description?: string | null
+          discord_channel_id?: string | null
+          discord_guild_id?: string | null
           id?: string
           message_thread_id?: number | null
           topic_name?: string
         }
         Relationships: []
+      }
+      tf_topic_access: {
+        Row: {
+          created_at: string | null
+          id: string
+          role: string
+          skill: string | null
+          topic_name: string
+        }
+        Insert: {
+          created_at?: string | null
+          id?: string
+          role?: string
+          skill?: string | null
+          topic_name: string
+        }
+        Update: {
+          created_at?: string | null
+          id?: string
+          role?: string
+          skill?: string | null
+          topic_name?: string
+        }
+        Relationships: []
+      }
+      tf_topic_team_access: {
+        Row: {
+          created_at: string | null
+          id: string
+          team_id: string
+          topic_name: string
+        }
+        Insert: {
+          created_at?: string | null
+          id?: string
+          team_id: string
+          topic_name: string
+        }
+        Update: {
+          created_at?: string | null
+          id?: string
+          team_id?: string
+          topic_name?: string
+        }
+        Relationships: [
+          {
+            foreignKeyName: "tf_topic_team_access_team_id_fkey"
+            columns: ["team_id"]
+            isOneToOne: false
+            referencedRelation: "tf_teams"
+            referencedColumns: ["id"]
+          },
+        ]
       }
       tf_va_tokens: {
         Row: {
@@ -2990,6 +3133,60 @@ export type Database = {
           retention_curve?: string | null
           sub_category?: string | null
           updated_at?: string | null
+        }
+        Relationships: []
+      }
+      worker_api_stats: {
+        Row: {
+          id: number
+          stats: Json | null
+          updated_at: string | null
+        }
+        Insert: {
+          id: number
+          stats?: Json | null
+          updated_at?: string | null
+        }
+        Update: {
+          id?: number
+          stats?: Json | null
+          updated_at?: string | null
+        }
+        Relationships: []
+      }
+      worker_cycles: {
+        Row: {
+          accounts: number | null
+          batch_no: number | null
+          created_at: string
+          duration_sec: number | null
+          extras: Json | null
+          failed: number | null
+          id: number
+          refreshed: number | null
+          started_at: string
+        }
+        Insert: {
+          accounts?: number | null
+          batch_no?: number | null
+          created_at?: string
+          duration_sec?: number | null
+          extras?: Json | null
+          failed?: number | null
+          id?: number
+          refreshed?: number | null
+          started_at?: string
+        }
+        Update: {
+          accounts?: number | null
+          batch_no?: number | null
+          created_at?: string
+          duration_sec?: number | null
+          extras?: Json | null
+          failed?: number | null
+          id?: number
+          refreshed?: number | null
+          started_at?: string
         }
         Relationships: []
       }

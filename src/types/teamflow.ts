@@ -11,6 +11,7 @@ export interface TfMember {
   name: string
   telegram_id: number | null
   telegram_username: string | null
+  discord_id: string | null
   email: string | null
   role: MemberRole
   status: MemberStatus
@@ -127,6 +128,7 @@ export interface TfSop {
   created_by: string | null
   tags: string[]
   telegram_message_id: number | null
+  discord_message_id: string | null
   created_at: string
   updated_at: string
 }
@@ -145,9 +147,11 @@ export interface TfSopVersion {
 export interface TfTelegramTopic {
   id: string
   topic_name: string
-  chat_id: number
+  chat_id: number | null
   message_thread_id: number | null
   description: string | null
+  discord_channel_id: string | null
+  discord_guild_id: string | null
   created_at: string
 }
 
@@ -163,6 +167,7 @@ export interface TfTeam {
   id: string
   name: string
   description: string | null
+  discord_role_id: string | null
   created_at: string
 }
 

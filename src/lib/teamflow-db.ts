@@ -1,5 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import { sendToTopic } from '@/lib/telegram-topics'
+import { notifyDiscordChannel } from '@/lib/discord-notify'
 import type { TfBoard, TfMember, TfTask } from '@/types/teamflow'
 
 type AdminClient = ReturnType<typeof createAdminClient>
@@ -176,7 +177,11 @@ export async function notifyTaskAssigned(
 ): Promise<void> {
   const message = `📌 New task assigned to ${assigneeName}: "${task.title}"\nPriority: ${task.priority}\nDue: ${formatDueDate(task.due_date)}`
   await sendToTopic('notifications', message)
-  if (task.platform) await sendToTopic(task.platform, message)
+  await notifyDiscordChannel('notifications', message)
+  if (task.platform) {
+    await sendToTopic(task.platform, message)
+    await notifyDiscordChannel(task.platform, message)
+  }
 }
 
 export async function notifyTaskCompleted(
@@ -185,7 +190,11 @@ export async function notifyTaskCompleted(
 ): Promise<void> {
   const message = `✅ Task completed${assigneeName ? ` by ${assigneeName}` : ''}: "${task.title}"`
   await sendToTopic('notifications', message)
-  if (task.platform) await sendToTopic(task.platform, message)
+  await notifyDiscordChannel('notifications', message)
+  if (task.platform) {
+    await sendToTopic(task.platform, message)
+    await notifyDiscordChannel(task.platform, message)
+  }
 }
 
 export async function logActivity(

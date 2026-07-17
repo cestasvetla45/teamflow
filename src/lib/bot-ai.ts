@@ -1,8 +1,9 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import type { Platform, SopCategory, TfMember, TfSop, TfTask } from '@/types/teamflow'
 import { findTaskByPrefix, isOverdue, logActivity } from '@/lib/teamflow-db'
-import { createSOP, generateSOPDiff, updateSOP, syncSOPToTelegram } from '@/lib/sops'
-import { sendToTopic } from '@/lib/telegram-topics'
+import { createSOP, generateSOPDiff, updateSOP, syncSOPToTelegram, syncSOPToDiscord } from '@/lib/sops'
+import { sendToTopic, announceTopicAccessGranted } from '@/lib/telegram-topics'
+import { notifyDiscordChannel } from '@/lib/discord-notify'
 
 const supabase = createAdminClient()
 
@@ -308,7 +309,11 @@ async function postSopChangeAnnouncement(sopTitle: string, changesBody: string, 
   const message = `📢 SOP Updated: "${sopTitle}"\n\n${changesBody}\n\nFull SOP: 📋 SOPs topic`
   const targetTopic = platform && platform !== 'general' ? platform : 'general'
   await sendToTopic(targetTopic, message)
-  if (targetTopic !== 'sops') await sendToTopic('sops', message)
+  await notifyDiscordChannel(targetTopic, message)
+  if (targetTopic !== 'sops') {
+    await sendToTopic('sops', message)
+    await notifyDiscordChannel('sops', message)
+  }
 }
 
 async function executeTool(
@@ -498,6 +503,8 @@ async function executeTool(
       .upsert({ topic_name: topicName, team_id: team.id }, { onConflict: 'topic_name,team_id' })
     if (error) return `Failed to grant access: ${error.message}`
 
+    await announceTopicAccessGranted(topicName, team.name)
+
     return `Granted team "${team.name}" access to the ${topicName} topic.`
   }
 
@@ -523,6 +530,7 @@ async function executeTool(
       })
 
       await syncSOPToTelegram(updated.id)
+      await syncSOPToDiscord(updated.id)
 
       const diff = await generateSOPDiff(oldContent, content)
       const announcePlatform = updated.platform ?? 'general'
@@ -533,6 +541,7 @@ async function executeTool(
 
     const created = await createSOP({ title, content, category, platform, createdBy: opts.senderId })
     await syncSOPToTelegram(created.id)
+    await syncSOPToDiscord(created.id)
 
     return `✅ Created SOP "${created.title}" from your file. It's been posted in the 📋 SOPs topic.`
   }
@@ -554,6 +563,7 @@ async function executeTool(
 
     const fullMessage = args.file_summary ? `${message}\n\n📎 ${args.file_summary}` : message
     const messageId = await sendToTopic(targetTopic, fullMessage)
+    await notifyDiscordChannel(targetTopic, fullMessage)
     if (!messageId) return `Failed to post to the ${targetTopic} topic. Check the topic is configured.`
 
     return `✅ Distributed to "${team.name}" in the ${targetTopic} topic.`
