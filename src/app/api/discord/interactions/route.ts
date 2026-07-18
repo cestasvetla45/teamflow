@@ -1,24 +1,39 @@
 import { NextRequest, NextResponse } from 'next/server'
 import nacl from 'tweetnacl'
 import { dispatchCommand, type DiscordInteraction } from '@/lib/discord-commands'
+import { chunkDiscordMessage } from '@/lib/discord-api'
 
 export const runtime = 'nodejs'
 
 const DISCORD_PUBLIC_KEY = process.env.DISCORD_PUBLIC_KEY!
 const DISCORD_APP_ID = process.env.DISCORD_APP_ID!
-const MAX_CONTENT_LENGTH = 1900
 
-function truncate(content: string): string {
-  if (content.length <= MAX_CONTENT_LENGTH) return content
-  return `${content.slice(0, MAX_CONTENT_LENGTH)}\n… (truncated)`
-}
-
-async function sendFollowUp(interactionToken: string, content: string): Promise<void> {
+// Edits the deferred placeholder response (used by /setup, which can run past the 3s window).
+async function editOriginal(interactionToken: string, content: string): Promise<void> {
   await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${interactionToken}/messages/@original`, {
     method: 'PATCH',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ content: truncate(content) }),
+    body: JSON.stringify({ content }),
   })
+}
+
+// Posts an additional message tied to this interaction (used to chunk replies past Discord's 2000-char cap).
+async function postFollowUp(interactionToken: string, content: string): Promise<void> {
+  await fetch(`https://discord.com/api/v10/webhooks/${DISCORD_APP_ID}/${interactionToken}`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ content, flags: 64 }),
+  })
+}
+
+// Sends a (possibly long) reply as the initial response's content plus follow-up
+// messages for any overflow, so nothing gets silently truncated.
+async function sendChunked(interactionToken: string, content: string): Promise<void> {
+  const [first, ...rest] = chunkDiscordMessage(content)
+  await editOriginal(interactionToken, first)
+  for (const chunk of rest) {
+    await postFollowUp(interactionToken, chunk)
+  }
 }
 
 export async function POST(req: NextRequest) {
@@ -55,13 +70,10 @@ export async function POST(req: NextRequest) {
   // then edit the deferred reply once setup finishes.
   if (interaction.data.name === 'setup') {
     dispatchCommand(interaction)
-      .then((content) => sendFollowUp(interaction.token, content))
+      .then((content) => sendChunked(interaction.token, content))
       .catch((err) => {
         console.error('Discord /setup failed:', err)
-        void sendFollowUp(
-          interaction.token,
-          `❌ Setup failed: ${err instanceof Error ? err.message : 'unknown error'}`
-        )
+        void editOriginal(interaction.token, `❌ Setup failed: ${err instanceof Error ? err.message : 'unknown error'}`)
       })
 
     return NextResponse.json({ type: 5, data: { flags: 64 } })
@@ -69,7 +81,19 @@ export async function POST(req: NextRequest) {
 
   try {
     const content = await dispatchCommand(interaction)
-    return NextResponse.json({ type: 4, data: { content: truncate(content), flags: 64 } })
+    const [first, ...rest] = chunkDiscordMessage(content)
+
+    if (rest.length > 0) {
+      // Fire the overflow chunks as follow-up messages once the initial response lands —
+      // can't await them before responding since Discord requires a reply within 3s.
+      void (async () => {
+        for (const chunk of rest) {
+          await postFollowUp(interaction.token, chunk)
+        }
+      })()
+    }
+
+    return NextResponse.json({ type: 4, data: { content: first, flags: 64 } })
   } catch (err) {
     console.error('Discord command failed:', err)
     return NextResponse.json({

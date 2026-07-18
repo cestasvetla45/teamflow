@@ -1,6 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import { setupDiscordServer } from '@/lib/discord-setup'
-import { assignRole } from '@/lib/discord-api'
+import { assignRole, getGuild } from '@/lib/discord-api'
 import { getMemberWorkload } from '@/lib/workload'
 import { listSOPs } from '@/lib/sops'
 import { notifyTaskAssigned, notifyTaskCompleted } from '@/lib/teamflow-db'
@@ -12,6 +12,7 @@ import {
   isOverdue,
   logActivity,
 } from '@/lib/teamflow-db'
+import { executeTool, type ToolContext } from '@/lib/ai/tools'
 import type { Platform, TaskPriority, TfMember, TfSop, TfTask, TfTeam } from '@/types/teamflow'
 
 const supabase = createAdminClient()
@@ -20,7 +21,7 @@ const supabase = createAdminClient()
 export interface DiscordOption {
   name: string
   type: number
-  value?: string
+  value?: string | number | boolean
 }
 
 export interface DiscordResolvedUser {
@@ -49,7 +50,15 @@ export interface DiscordInteraction {
 }
 
 function getOption(interaction: DiscordInteraction, name: string): string | undefined {
-  return interaction.data.options?.find((o) => o.name === name)?.value
+  const value = interaction.data.options?.find((o) => o.name === name)?.value
+  return value === undefined ? undefined : String(value)
+}
+
+function getOptionNumber(interaction: DiscordInteraction, name: string): number | undefined {
+  const value = interaction.data.options?.find((o) => o.name === name)?.value
+  if (value === undefined) return undefined
+  const n = Number(value)
+  return isNaN(n) ? undefined : n
 }
 
 function getOptionUser(interaction: DiscordInteraction, name: string): DiscordResolvedUser | undefined {
@@ -95,12 +104,31 @@ async function ensureDiscordMemberExists(user: DiscordResolvedUser): Promise<TfM
   return data as TfMember
 }
 
-async function isAdminDiscord(user: DiscordResolvedUser): Promise<boolean> {
+/** Admin gate: env-configured admin id, tf_members.role='admin', or the guild owner. */
+async function isAdminDiscord(user: DiscordResolvedUser, guildId?: string): Promise<boolean> {
   const adminId = process.env.ADMIN_DISCORD_ID
   if (adminId && String(adminId) === user.id) return true
 
   const member = await getMemberByDiscordId(user.id)
-  return member?.role === 'admin'
+  if (member?.role === 'admin') return true
+
+  if (guildId) {
+    try {
+      const guild = await getGuild(guildId)
+      if (guild.owner_id === user.id) return true
+    } catch (err) {
+      console.error('Failed to fetch guild for owner admin check:', err)
+    }
+  }
+
+  return false
+}
+
+/** Builds a ToolContext for ai/tools.ts executors from the calling interaction's member/admin state. */
+async function buildToolContext(interaction: DiscordInteraction): Promise<{ ctx: ToolContext; user: DiscordResolvedUser }> {
+  const user = caller(interaction)
+  const [sender, isAdmin] = await Promise.all([getMemberByDiscordId(user.id), isAdminDiscord(user, interaction.guild_id)])
+  return { ctx: { isAdmin, sender }, user }
 }
 
 async function requireOwnTask(
@@ -148,9 +176,13 @@ function teamEmoji(teamName: string): string {
 export async function handleHelp(): Promise<string> {
   return `**TeamFlow Bot commands**
 
+Or just talk to me naturally (@mention me, or type in #bot-commands) — I can do all of this and more.
+
+**Self-service**
 /mytasks — your tasks, grouped by status
 /done <id> — mark your task as complete
 /start <id> — start a task (move to in progress)
+/pause <id> — move your task back to To Do
 /myworkload — your workload
 /mydone — your completed tasks (last 7 days)
 /teams — list all teams
@@ -159,10 +191,20 @@ export async function handleHelp(): Promise<string> {
 /who <skill> — find available members with a skill
 /status — board status summary
 /overdue — list overdue tasks
-/addtask <title> [assignee] [priority] [due_date] [platform] — create a task (admin)
-/addmember <user> [team] — add a member (admin)
-/addteam <name> — create a team (admin)
-/assignrole <team> <role> — map a Discord role to a team (admin)
+/myvault — your vault items
+/vatodo [handle] — Instagram VA daily checklist
+/logreel <url> [handle] — log a posted reel
+
+**Tasks (admin)**
+/addtask, /task, /complete, /assign, /reassign, /update, /deltask, /attach, /attachments, /recurring, /stoprecurring, /search
+
+**Members & teams (admin)**
+/addmember, /addteam, /assignrole, /members, /member, /skills, /addskill, /removeskill, /granttopic, /revoketopic, /topicaccess
+
+**Boards & insight (admin)**
+/boards, /addboard, /stats, /workload, /free [skill]
+
+**Setup**
 /setup — auto-create server structure (admin)
 /help — show this message`
 }
@@ -588,6 +630,182 @@ export async function handleSetupCommand(interaction: DiscordInteraction): Promi
   ].join('\n')
 }
 
+// ─── Tool-backed handlers ───────────────────────────────────────────────────
+// These delegate to ai/tools.ts's shared executors — the same code path
+// natural-language requests use — so slash commands and chat stay consistent,
+// and admin gating (MEMBER_SELF_SERVICE_TOOLS) is enforced in one place.
+
+async function runTool(interaction: DiscordInteraction, toolName: string, args: Record<string, unknown>): Promise<string> {
+  const { ctx } = await buildToolContext(interaction)
+  return executeTool(toolName, args, ctx)
+}
+
+export async function handleTaskDetails(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /task <query>'
+  return runTool(interaction, 'task_details', { task_query: query })
+}
+
+export async function handleCompleteTask(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /complete <query>'
+  return runTool(interaction, 'complete_task', { task_query: query })
+}
+
+export async function handleAssignTask(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  const member = getOptionUser(interaction, 'member')
+  if (!query || !member) return 'Usage: /assign <query> <member>'
+  return runTool(interaction, 'reassign_task', { task_query: query, assignee_name: member.username })
+}
+
+export async function handleUpdateTask(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /update <query> [fields...]'
+  const assignee = getOptionUser(interaction, 'assignee')
+  return runTool(interaction, 'update_task', {
+    task_query: query,
+    title: getOption(interaction, 'title'),
+    description: getOption(interaction, 'description'),
+    priority: getOption(interaction, 'priority'),
+    platform: getOption(interaction, 'platform'),
+    status: getOption(interaction, 'status'),
+    due_date: getOption(interaction, 'due_date'),
+    estimated_hours: getOptionNumber(interaction, 'estimated_hours'),
+    assignee_name: assignee?.username,
+  })
+}
+
+export async function handleDeleteTask(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /deltask <query>'
+  return runTool(interaction, 'delete_task', { task_query: query })
+}
+
+export async function handleAttach(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  const url = getOption(interaction, 'url')
+  if (!query || !url) return 'Usage: /attach <query> <url> [title]'
+  return runTool(interaction, 'add_task_attachment', { task_query: query, url, title: getOption(interaction, 'title') })
+}
+
+export async function handleAttachments(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /attachments <query>'
+  return runTool(interaction, 'list_task_attachments', { task_query: query })
+}
+
+export async function handleRecurring(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  const pattern = getOption(interaction, 'pattern')
+  if (!query || !pattern) return 'Usage: /recurring <query> <daily|weekly|weekday>'
+  return runTool(interaction, 'make_task_recurring', { task_query: query, pattern })
+}
+
+export async function handleStopRecurring(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /stoprecurring <query>'
+  return runTool(interaction, 'stop_task_recurring', { task_query: query })
+}
+
+export async function handleSearchTasks(interaction: DiscordInteraction): Promise<string> {
+  const query = getOption(interaction, 'query')
+  if (!query) return 'Usage: /search <query>'
+  return runTool(interaction, 'search_tasks', { query })
+}
+
+export async function handleMembersList(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'list_members', {})
+}
+
+export async function handleMemberDetails(interaction: DiscordInteraction): Promise<string> {
+  const target = getOptionUser(interaction, 'user')
+  if (!target) return 'Usage: /member <user>'
+  return runTool(interaction, 'member_details', { member_name: target.username })
+}
+
+export async function handleSkillsList(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'list_skills', {})
+}
+
+export async function handleAddSkill(interaction: DiscordInteraction): Promise<string> {
+  const member = getOptionUser(interaction, 'member')
+  const skill = getOption(interaction, 'skill')
+  if (!member || !skill) return 'Usage: /addskill <member> <skill> [proficiency]'
+  return runTool(interaction, 'assign_skill', {
+    member_name: member.username,
+    skill_name: skill,
+    proficiency: getOptionNumber(interaction, 'proficiency'),
+  })
+}
+
+export async function handleRemoveSkill(interaction: DiscordInteraction): Promise<string> {
+  const member = getOptionUser(interaction, 'member')
+  const skill = getOption(interaction, 'skill')
+  if (!member || !skill) return 'Usage: /removeskill <member> <skill>'
+  return runTool(interaction, 'remove_skill', { member_name: member.username, skill_name: skill })
+}
+
+export async function handleBoardsList(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'list_boards', {})
+}
+
+export async function handleAddBoard(interaction: DiscordInteraction): Promise<string> {
+  const name = getOption(interaction, 'name')
+  if (!name) return 'Usage: /addboard <name> [description]'
+  return runTool(interaction, 'create_board', { name, description: getOption(interaction, 'description') })
+}
+
+export async function handleTeamStats(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'team_stats', {})
+}
+
+export async function handleTeamWorkload(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'team_workload', {})
+}
+
+export async function handleWhoIsFree(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'who_is_free', { skill_name: getOption(interaction, 'skill') })
+}
+
+export async function handleVaTodoCommand(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'va_todo', { account_handle: getOption(interaction, 'handle') })
+}
+
+export async function handleLogReelCommand(interaction: DiscordInteraction): Promise<string> {
+  const url = getOption(interaction, 'url')
+  if (!url) return 'Usage: /logreel <url> [handle]'
+  return runTool(interaction, 'log_reel_post', { reel_url: url, account_handle: getOption(interaction, 'handle') })
+}
+
+export async function handleMyVault(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'my_vault_items', {})
+}
+
+export async function handlePause(interaction: DiscordInteraction): Promise<string> {
+  const id = getOption(interaction, 'id')
+  if (!id) return 'Usage: /pause <id>'
+  return runTool(interaction, 'pause_my_task', { task_query: id })
+}
+
+export async function handleGrantTopic(interaction: DiscordInteraction): Promise<string> {
+  const topic = getOption(interaction, 'topic')
+  const team = getOption(interaction, 'team')
+  if (!topic || !team) return 'Usage: /granttopic <topic> <team>'
+  return runTool(interaction, 'grant_topic_access', { topic_name: topic, team_name: team })
+}
+
+export async function handleRevokeTopic(interaction: DiscordInteraction): Promise<string> {
+  const topic = getOption(interaction, 'topic')
+  const team = getOption(interaction, 'team')
+  if (!topic || !team) return 'Usage: /revoketopic <topic> <team>'
+  return runTool(interaction, 'revoke_topic_access', { topic_name: topic, team_name: team })
+}
+
+export async function handleTopicAccessList(interaction: DiscordInteraction): Promise<string> {
+  return runTool(interaction, 'list_topic_access', {})
+}
+
 // ─── Dispatcher ─────────────────────────────────────────────────────────────
 
 const ADMIN_ONLY_COMMANDS = new Set(['addtask', 'addmember', 'addteam', 'assignrole', 'setup'])
@@ -596,7 +814,7 @@ export async function dispatchCommand(interaction: DiscordInteraction): Promise<
   const name = interaction.data.name
   const user = caller(interaction)
 
-  if (ADMIN_ONLY_COMMANDS.has(name) && !(await isAdminDiscord(user))) {
+  if (ADMIN_ONLY_COMMANDS.has(name) && !(await isAdminDiscord(user, interaction.guild_id))) {
     return '🚫 Only an admin can do that.'
   }
 
@@ -635,6 +853,62 @@ export async function dispatchCommand(interaction: DiscordInteraction): Promise<
       return handleAssignRole(interaction)
     case 'setup':
       return handleSetupCommand(interaction)
+    case 'task':
+      return handleTaskDetails(interaction)
+    case 'complete':
+      return handleCompleteTask(interaction)
+    case 'assign':
+      return handleAssignTask(interaction)
+    case 'reassign':
+      return handleAssignTask(interaction)
+    case 'update':
+      return handleUpdateTask(interaction)
+    case 'deltask':
+      return handleDeleteTask(interaction)
+    case 'attach':
+      return handleAttach(interaction)
+    case 'attachments':
+      return handleAttachments(interaction)
+    case 'recurring':
+      return handleRecurring(interaction)
+    case 'stoprecurring':
+      return handleStopRecurring(interaction)
+    case 'search':
+      return handleSearchTasks(interaction)
+    case 'members':
+      return handleMembersList(interaction)
+    case 'member':
+      return handleMemberDetails(interaction)
+    case 'skills':
+      return handleSkillsList(interaction)
+    case 'addskill':
+      return handleAddSkill(interaction)
+    case 'removeskill':
+      return handleRemoveSkill(interaction)
+    case 'boards':
+      return handleBoardsList(interaction)
+    case 'addboard':
+      return handleAddBoard(interaction)
+    case 'stats':
+      return handleTeamStats(interaction)
+    case 'workload':
+      return handleTeamWorkload(interaction)
+    case 'free':
+      return handleWhoIsFree(interaction)
+    case 'vatodo':
+      return handleVaTodoCommand(interaction)
+    case 'logreel':
+      return handleLogReelCommand(interaction)
+    case 'myvault':
+      return handleMyVault(interaction)
+    case 'pause':
+      return handlePause(interaction)
+    case 'granttopic':
+      return handleGrantTopic(interaction)
+    case 'revoketopic':
+      return handleRevokeTopic(interaction)
+    case 'topicaccess':
+      return handleTopicAccessList(interaction)
     default:
       return `Unknown command: /${name}`
   }

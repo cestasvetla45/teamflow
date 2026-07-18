@@ -1,6 +1,7 @@
 import { Telegraf, Markup, Context } from 'telegraf'
 import { createAdminClient } from '@/lib/supabase/admin'
-import { generateAIResponse, generateAIResponseWithFile } from '@/lib/bot-ai'
+import { runAssistant } from '@/lib/ai'
+import { executeTool } from '@/lib/ai/tools'
 import { getMemberWorkload } from '@/lib/workload'
 import { listSOPs, syncSOPToTelegram, syncSOPToDiscord } from '@/lib/sops'
 import { getVATodoMessage } from '@/lib/va-todo'
@@ -62,18 +63,33 @@ function reply(ctx: Context, text: string, extra?: Parameters<Context['reply']>[
   })
 }
 
+// ---------------------------------------------------------------------------
+// telegram_id + username capture — runs FIRST, before any gating or command
+// handler, for every incoming update (private chat, group, callback query —
+// anything carrying ctx.from). If the sender's telegram_id isn't on a
+// tf_members row yet, ensureMemberExists tries to match an existing row by
+// telegram_username (case-insensitive, no leading @) and links the id there;
+// otherwise it auto-creates a new member. The configured admin id is skipped
+// since the admin isn't necessarily meant to be a tf_members row.
+// ---------------------------------------------------------------------------
 bot.use(async (ctx, next) => {
-  // Private chat: always respond, no gating needed. Still auto-register first-time senders.
-  if (ctx.chat?.type === 'private') {
-    if (ctx.from && !isAdminTelegramId(ctx.from.id)) {
+  if (ctx.from && !ctx.from.is_bot && !isAdminTelegramId(ctx.from.id)) {
+    try {
       await ensureMemberExists(supabase, {
         telegram_id: ctx.from.id,
         telegram_username: ctx.from.username,
         name: ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : ''),
       })
+    } catch (err) {
+      console.error('Failed to auto-register/link Telegram member:', err)
     }
-    return next()
   }
+  return next()
+})
+
+bot.use(async (ctx, next) => {
+  // Private chat: always respond, no gating needed.
+  if (ctx.chat?.type === 'private') return next()
 
   const message = ctx.message
   if (!message) return next()
@@ -99,14 +115,6 @@ bot.use(async (ctx, next) => {
   if (!isCommand && isMentioned) {
     if (hasText) message.text = stripMention(text)
     else if (hasCaption) (message as { caption?: string }).caption = stripMention(text)
-  }
-
-  if (ctx.from && !isAdminTelegramId(ctx.from.id)) {
-    await ensureMemberExists(supabase, {
-      telegram_id: ctx.from.id,
-      telegram_username: ctx.from.username,
-      name: ctx.from.first_name + (ctx.from.last_name ? ' ' + ctx.from.last_name : ''),
-    })
   }
 
   return next()
@@ -379,6 +387,45 @@ function commandArgs(text: string | undefined): string {
   return spaceIdx === -1 ? '' : text.slice(spaceIdx + 1).trim()
 }
 
+// ---------------------------------------------------------------------------
+// AI core wiring — chatKey construction + a thin wrapper so structured
+// commands can call ai/tools.ts executors directly (fast path, no LLM round
+// trip) while free text goes through runAssistant (see bottom of file).
+// ---------------------------------------------------------------------------
+
+/** Stable per-conversation key per SPEC: tg:<chat_id>:<thread_id|'dm'>:<user_id>. */
+function chatKeyFor(ctx: Context): string {
+  const chatId = ctx.chat?.id ?? 0
+  const threadId = ctx.message && 'message_thread_id' in ctx.message ? ctx.message.message_thread_id : undefined
+  const userId = ctx.from?.id ?? 0
+  return `tg:${chatId}:${threadId ?? 'dm'}:${userId}`
+}
+
+/** Runs an ai/tools.ts executor for the sender behind this ctx, with the same admin gate the AI itself uses. */
+async function callTool(ctx: Context, toolName: string, args: Record<string, unknown>): Promise<string> {
+  const sender = ctx.from ? await getMemberByTelegramId(supabase, ctx.from.id) : null
+  const isAdmin = isAdminTelegramId(ctx.from?.id)
+  return executeTool(toolName, args, { isAdmin, sender })
+}
+
+/** Splits "a | b | c" into trimmed, non-empty segments — used by pipe-delimited command syntax. */
+function splitPipes(text: string): string[] {
+  return text.split('|').map((s) => s.trim()).filter((s) => s.length > 0)
+}
+
+/** Parses "key=value, key2=value2" (comma or semicolon separated) into a lowercase-keyed record. */
+function parseKeyValuePairs(text: string): Record<string, string> {
+  const out: Record<string, string> = {}
+  for (const chunk of text.split(/[,;]/)) {
+    const eq = chunk.indexOf('=')
+    if (eq === -1) continue
+    const key = chunk.slice(0, eq).trim().toLowerCase()
+    const value = chunk.slice(eq + 1).trim()
+    if (key && value) out[key] = value
+  }
+  return out
+}
+
 // Splits command args into tokens, treating "quoted phrases" as a single token —
 // needed for team/topic names that contain spaces, e.g. /addmemberteam Alice "Instagram VAs"
 function parseQuotedArgs(text: string): string[] {
@@ -466,48 +513,87 @@ Here's what you can do:
 You can also just ask me questions like:
 "What are my tasks?" or "Mark the landing page task as done"`
 
-const HELP_TEXT = `<b>TeamFlow Bot commands</b>
+const SELF_SERVICE_HELP = `📋 <b>Your tasks</b>
+/mytasks or /mine — your tasks, grouped by status
+/done &lt;id&gt; — mark a task complete
+/start &lt;id&gt; — start a task (→ In Progress)
+/pause &lt;id&gt; — pause a task (→ To Do)
+/mydone — tasks you completed this week
+/myworkload — your workload
+/taskinfo &lt;task_query&gt; — full task details
+/search &lt;query&gt; — search tasks
 
-/addtask &lt;title&gt; — create and assign a task
-/myteam — team overview
+👥 <b>Team</b>
+/myteam — your team &amp; teammates
 /who &lt;skill&gt; — find available members with a skill
-/status — board status summary
-/overdue — list overdue tasks
-/task &lt;id&gt; — show task details
-/complete &lt;id&gt; — mark a task done
-/assign &lt;id&gt; @username — reassign a task
-/addmember &lt;name&gt; &lt;telegram_username&gt; [team] — add a team member
-/addskill &lt;name&gt; — add a skill to the catalog
-/addteam &lt;name&gt; — create a team (admin)
-/addmemberteam &lt;member&gt; &lt;team&gt; — add member to team (admin)
 /teams — list all teams
-/myteam — see your team
-/granttopic &lt;topic&gt; &lt;team&gt; — grant topic access to team (admin)
-/revoketopic &lt;topic&gt; &lt;team&gt; — revoke topic access (admin)
-/topicaccess — show topic access control (admin)
-/sops — list all Standard Operating Procedures
-/sop &lt;name&gt; — view a specific SOP
-/syncsops — sync all SOPs to the Telegram SOPs topic (admin only)
-/syncva — sync members to Reel Lab's VA system (admin only)
-/syncids — list members missing a Telegram ID (admin only)
-/mine — your own tasks
-/mytasks — your own tasks, grouped by status
-/done &lt;id&gt; — mark your own task as complete
-/start &lt;id&gt; — start your own task (move to In Progress)
-/pause &lt;id&gt; — pause your own task (move back to To Do)
-/mydone — your completed tasks (last 7 days)
-/myworkload — your own workload
-/vatodo [@handle] — VA daily checklist from Reel Lab (Instagram accounts)
-/cancel — cancel the current /addtask flow
+/sops — list SOPs
+/sop &lt;name&gt; — view an SOP
+
+🎬 <b>Reel Lab</b>
+/vatodo [@handle] — VA daily checklist
+/logreel &lt;url&gt; [@handle] [note] — log a posted reel
+/myvault — your vault items (passwords masked)
+
+/cancel — cancel an in-progress flow
 /help — show this message
 
-You can also just ask me things in plain English, e.g. "who has design skills free today?"
+You can also just talk to me in plain English — "what are my tasks", "mark the landing page task done", or send an Instagram reel link to log it.`
 
-<b>To use me in a group:</b>
-1. Add me to the group
-2. In @BotFather, run /setprivacy, select me, choose "Disable"
-3. Make me an admin in the group
-4. @mention me to talk to me: "@${BOT_USERNAME} who has free time?"`
+const ADMIN_HELP = `🛠 <b>Admin — Tasks</b>
+/addtask &lt;title&gt; — create &amp; assign a task (guided)
+/task &lt;id&gt; — task details by id
+/taskinfo &lt;task_query&gt; — full task details (fuzzy match)
+/search &lt;query&gt; — search tasks
+/complete &lt;id&gt; — mark any task done
+/assign &lt;id&gt; @username — reassign a task
+/update &lt;task_query&gt; | field=value, field2=value2 — edit a task
+/deltask &lt;task_query&gt; — delete a task
+/attach &lt;task_query&gt; | &lt;url&gt; [| title] — attach a link
+/attachments &lt;task_query&gt; — list attachments
+/recurring &lt;task_query&gt; &lt;daily|weekly|weekday&gt; — make recurring
+/stoprecurring &lt;task_query&gt; — stop recurrence
+/status — board status summary
+/overdue — list overdue tasks
+
+🛠 <b>Admin — People</b>
+/members — list all members
+/member &lt;name&gt; — member details
+/addmember &lt;name&gt; &lt;telegram_username&gt; [team] — add a member
+/addskill &lt;name&gt; — add a skill to the catalog
+/skills — list skills
+/removeskill &lt;member&gt; | &lt;skill&gt; — remove a skill from a member
+/addteam &lt;name&gt; — create a team
+/addmemberteam &lt;member&gt; &lt;team&gt; — add member to team
+/removememberteam &lt;member&gt; &lt;team&gt; — remove member from team
+/teams — list all teams
+
+🛠 <b>Admin — Boards &amp; topics</b>
+/boards — list boards
+/addboard &lt;name&gt; [| description] — create a board
+/granttopic &lt;topic&gt; &lt;team&gt; — grant topic access to team
+/revoketopic &lt;topic&gt; &lt;team&gt; — revoke topic access
+/topicaccess — show topic access control
+
+🛠 <b>Admin — SOPs</b>
+/newsop &lt;title&gt; | &lt;content&gt; [| category] [| platform] — create/update an SOP
+/syncsops — sync all SOPs to the Telegram SOPs topic
+/syncva — sync members to Reel Lab's VA system
+/syncids — list members missing a Telegram ID
+
+🛠 <b>Admin — Insight</b>
+/stats — team totals (tasks, overdue, completed)
+/free [skill] — who's available right now
+/workload — team-wide workload
+/logreel &lt;url&gt; [@handle] [note] — log a posted reel
+
+/cancel — cancel the current /addtask flow
+/help — show this message`
+
+function helpText(isAdmin: boolean): string {
+  const body = isAdmin ? `${ADMIN_HELP}\n\n${SELF_SERVICE_HELP}` : SELF_SERVICE_HELP
+  return `<b>TeamFlow Bot commands</b>\n\n${body}\n\n<b>To use me in a group:</b>\n1. Add me to the group\n2. In @BotFather, run /setprivacy, select me, choose "Disable"\n3. Make me an admin in the group\n4. @mention me to talk to me: "@${BOT_USERNAME} who has free time?"`
+}
 
 bot.start(async (ctx) => {
   const arg = ctx.message && 'text' in ctx.message ? commandArgs(ctx.message.text) : ''
@@ -542,13 +628,13 @@ bot.start(async (ctx) => {
   }
 
   await reply(ctx,
-    `👋 Welcome to <b>TeamFlow Bot</b>!\n\nI help manage tasks and team workload for this group.\n\n${HELP_TEXT}\n\n${CHAT_HISTORY_VISIBILITY_INSTRUCTIONS}`,
+    `👋 Welcome to <b>TeamFlow Bot</b>!\n\nI help manage tasks and team workload for this group.\n\n${helpText(true)}\n\n${CHAT_HISTORY_VISIBILITY_INSTRUCTIONS}`,
     { parse_mode: 'HTML' }
   )
 })
 
 bot.command('help', async (ctx) => {
-  await reply(ctx, HELP_TEXT, { parse_mode: 'HTML' })
+  await reply(ctx, helpText(isAdminTelegramId(ctx.from?.id)), { parse_mode: 'HTML' })
 })
 
 bot.command('cancel', async (ctx) => {
@@ -1710,9 +1796,210 @@ bot.command('vatodo', async (ctx) => {
   const text = ctx.message?.text || ''
   const parts = text.split(/\s+/)
   const accountHandle = parts[1]?.replace(/^@/, '')
-  
+
   const msg = await getVATodoMessage(accountHandle)
   await reply(ctx, msg, { parse_mode: 'HTML' })
+})
+
+// ---------------------------------------------------------------------------
+// Parity commands (TASK_27 / Worker C scope) — thin wrappers over the shared
+// ai/tools.ts executors. These bypass the Gemini round trip for structured
+// input; the admin/self-service gate is enforced by executeTool itself, so
+// most of these are effectively admin-only (see MEMBER_SELF_SERVICE_TOOLS in
+// ai/tools.ts), except /logreel and /myvault which any registered member can use.
+// ---------------------------------------------------------------------------
+
+bot.command('attach', async (ctx) => {
+  const parts = splitPipes(commandArgs(ctx.message.text))
+  if (parts.length < 2) {
+    await reply(ctx, 'Usage: /attach <task_query> | <url> [| title]')
+    return
+  }
+  const [taskQuery, url, title] = parts
+  await reply(ctx, await callTool(ctx, 'add_task_attachment', { task_query: taskQuery, url, title }))
+})
+
+bot.command('attachments', async (ctx) => {
+  const q = commandArgs(ctx.message.text)
+  if (!q) {
+    await reply(ctx, 'Usage: /attachments <task_query>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'list_task_attachments', { task_query: q }))
+})
+
+bot.command('recurring', async (ctx) => {
+  const tokens = commandArgs(ctx.message.text).split(/\s+/).filter(Boolean)
+  if (tokens.length < 2) {
+    await reply(ctx, 'Usage: /recurring <task_query> <daily|weekly|weekday>')
+    return
+  }
+  const pattern = tokens[tokens.length - 1]
+  const taskQuery = tokens.slice(0, -1).join(' ')
+  await reply(ctx, await callTool(ctx, 'make_task_recurring', { task_query: taskQuery, pattern }))
+})
+
+bot.command('stoprecurring', async (ctx) => {
+  const q = commandArgs(ctx.message.text)
+  if (!q) {
+    await reply(ctx, 'Usage: /stoprecurring <task_query>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'stop_task_recurring', { task_query: q }))
+})
+
+bot.command('update', async (ctx) => {
+  const argsText = commandArgs(ctx.message.text)
+  const parts = argsText.split('|')
+  if (parts.length < 2 || !parts[0].trim()) {
+    await reply(
+      ctx,
+      'Usage: /update <task_query> | field=value, field2=value2\nFields: title, description, priority, platform, status, due_date, estimated_hours, assignee_name'
+    )
+    return
+  }
+  const taskQuery = parts[0].trim()
+  const kv = parseKeyValuePairs(parts.slice(1).join('|'))
+  const toolArgs: Record<string, unknown> = { task_query: taskQuery }
+  if (kv.title) toolArgs.title = kv.title
+  if (kv.description) toolArgs.description = kv.description
+  if (kv.priority) toolArgs.priority = kv.priority
+  if (kv.platform) toolArgs.platform = kv.platform
+  if (kv.status) toolArgs.status = kv.status
+  const due = kv.due_date ?? kv.due
+  if (due) toolArgs.due_date = due
+  const hours = kv.estimated_hours ?? kv.hours
+  if (hours) toolArgs.estimated_hours = Number(hours)
+  const assignee = kv.assignee_name ?? kv.assignee
+  if (assignee) toolArgs.assignee_name = assignee
+
+  if (Object.keys(toolArgs).length === 1) {
+    await reply(ctx, 'No recognized fields found. Use field=value, e.g. /update landing page | priority=high, due_date=friday')
+    return
+  }
+
+  await reply(ctx, await callTool(ctx, 'update_task', toolArgs))
+})
+
+bot.command('deltask', async (ctx) => {
+  const q = commandArgs(ctx.message.text)
+  if (!q) {
+    await reply(ctx, 'Usage: /deltask <task_query>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'delete_task', { task_query: q }))
+})
+
+bot.command('search', async (ctx) => {
+  const q = commandArgs(ctx.message.text)
+  if (!q) {
+    await reply(ctx, 'Usage: /search <query>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'search_tasks', { query: q }))
+})
+
+bot.command('taskinfo', async (ctx) => {
+  const q = commandArgs(ctx.message.text)
+  if (!q) {
+    await reply(ctx, 'Usage: /taskinfo <task_query>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'task_details', { task_query: q }))
+})
+
+bot.command('stats', async (ctx) => {
+  await reply(ctx, await callTool(ctx, 'team_stats', {}))
+})
+
+bot.command('free', async (ctx) => {
+  const skill = commandArgs(ctx.message.text)
+  await reply(ctx, await callTool(ctx, 'who_is_free', skill ? { skill_name: skill } : {}))
+})
+
+bot.command('workload', async (ctx) => {
+  await reply(ctx, await callTool(ctx, 'team_workload', {}))
+})
+
+bot.command('members', async (ctx) => {
+  await reply(ctx, await callTool(ctx, 'list_members', {}))
+})
+
+bot.command('member', async (ctx) => {
+  const q = commandArgs(ctx.message.text)
+  if (!q) {
+    await reply(ctx, 'Usage: /member <name>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'member_details', { member_name: q }))
+})
+
+bot.command('boards', async (ctx) => {
+  await reply(ctx, await callTool(ctx, 'list_boards', {}))
+})
+
+bot.command('addboard', async (ctx) => {
+  const parts = splitPipes(commandArgs(ctx.message.text))
+  if (parts.length === 0) {
+    await reply(ctx, 'Usage: /addboard <name> [| description]')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'create_board', { name: parts[0], description: parts[1] }))
+})
+
+bot.command('removeskill', async (ctx) => {
+  const parts = splitPipes(commandArgs(ctx.message.text))
+  if (parts.length < 2) {
+    await reply(ctx, 'Usage: /removeskill <member> | <skill>')
+    return
+  }
+  await reply(ctx, await callTool(ctx, 'remove_skill', { member_name: parts[0], skill_name: parts[1] }))
+})
+
+bot.command('skills', async (ctx) => {
+  await reply(ctx, await callTool(ctx, 'list_skills', {}))
+})
+
+bot.command('removememberteam', async (ctx) => {
+  const tokens = parseQuotedArgs(commandArgs(ctx.message.text))
+  if (tokens.length < 2) {
+    await reply(ctx, 'Usage: /removememberteam <member_name> <team_name>')
+    return
+  }
+  const memberName = tokens[0]
+  const teamName = tokens.slice(1).join(' ')
+  await reply(ctx, await callTool(ctx, 'remove_member_from_team', { member_name: memberName, team_name: teamName }))
+})
+
+bot.command('newsop', async (ctx) => {
+  const parts = splitPipes(commandArgs(ctx.message.text))
+  if (parts.length < 2) {
+    await reply(ctx, 'Usage: /newsop <title> | <content> [| category] [| platform] [| summary]')
+    return
+  }
+  const [title, content, category, platform, summary] = parts
+  await reply(ctx, await callTool(ctx, 'create_sop', { title, content, category, platform, summary }))
+})
+
+bot.command('logreel', async (ctx) => {
+  const tokens = commandArgs(ctx.message.text).split(/\s+/).filter(Boolean)
+  if (tokens.length === 0) {
+    await reply(ctx, 'Usage: /logreel <instagram_url> [@handle] [note...]')
+    return
+  }
+  const url = tokens[0]
+  let idx = 1
+  let handle: string | undefined
+  if (tokens[1]?.startsWith('@')) {
+    handle = tokens[1].slice(1)
+    idx = 2
+  }
+  const note = tokens.slice(idx).join(' ') || undefined
+  await reply(ctx, await callTool(ctx, 'log_reel_post', { reel_url: url, account_handle: handle, note }))
+})
+
+bot.command('myvault', async (ctx) => {
+  await reply(ctx, await callTool(ctx, 'my_vault_items', {}))
 })
 
 // ---------------------------------------------------------------------------
@@ -1742,13 +2029,16 @@ bot.on(['document', 'photo'], async (ctx) => {
     const sender = await getMemberByTelegramId(supabase, ctx.from.id)
     const admin = isAdminTelegramId(ctx.from.id)
 
-    const aiResponse = await generateAIResponseWithFile(
-      caption || 'What should I do with this file?',
-      content,
-      isImage ? buffer.toString('base64') : undefined,
-      isImage ? finalMimeType : undefined,
-      { sender, isAdmin: admin }
-    )
+    const aiResponse = await runAssistant({
+      text: caption || 'What should I do with this file?',
+      channel: 'telegram',
+      chatKey: chatKeyFor(ctx),
+      sender,
+      isAdmin: admin,
+      fileContent: content,
+      imageBase64: isImage ? buffer.toString('base64') : undefined,
+      imageMimeType: isImage ? finalMimeType : undefined,
+    })
 
     await reply(ctx, aiResponse)
   } catch (err) {
@@ -1758,7 +2048,41 @@ bot.on(['document', 'photo'], async (ctx) => {
 })
 
 // ---------------------------------------------------------------------------
-// Free text: due-date step of /addtask flow, or conversational AI
+// Reel-link auto-detect (TASK_27) — a private-chat message from a registered
+// member that contains an instagram.com/reel or /p/ URL. If the message is
+// essentially just the link, log it directly via the log_reel_post executor;
+// otherwise let it fall through to the AI (which also has log_reel_post and
+// will pick the link up from the message text).
+// ---------------------------------------------------------------------------
+
+const IG_REEL_URL_RE = /https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/[A-Za-z0-9_\-]+\/?[^\s]*/i
+
+async function tryHandleReelLinkAutoLog(
+  ctx: Context,
+  text: string,
+  sender: TfMember | null,
+  isAdmin: boolean
+): Promise<boolean> {
+  if (ctx.chat?.type !== 'private' || !sender) return false
+
+  const match = text.match(IG_REEL_URL_RE)
+  if (!match) return false
+
+  const url = match[0]
+  const remainder = text.replace(url, '').replace(/[\s.,!?~\-–—:;'"()]+/g, '')
+  if (remainder.length > 0) return false // not "essentially just the link" — let the AI handle it in context
+
+  await ctx.sendChatAction('typing')
+  const result = await executeTool('log_reel_post', { reel_url: url }, { isAdmin, sender })
+  await reply(ctx, result)
+  return true
+}
+
+// ---------------------------------------------------------------------------
+// Free text: due-date step of /addtask flow, reel-link auto-log, or
+// conversational AI (private-chat text and group @mention replies alike —
+// the group-gating middleware above already filtered out anything not
+// addressed to the bot before this handler runs).
 // ---------------------------------------------------------------------------
 
 bot.on('text', async (ctx) => {
@@ -1786,7 +2110,15 @@ bot.on('text', async (ctx) => {
   const sender = await getMemberByTelegramId(supabase, ctx.from.id)
   const admin = isAdminTelegramId(ctx.from.id)
 
+  if (await tryHandleReelLinkAutoLog(ctx, text, sender, admin)) return
+
   await ctx.sendChatAction('typing')
-  const aiReply = await generateAIResponse(text, { sender, isAdmin: admin })
+  const aiReply = await runAssistant({
+    text,
+    channel: 'telegram',
+    chatKey: chatKeyFor(ctx),
+    sender,
+    isAdmin: admin,
+  })
   await reply(ctx, aiReply)
 })

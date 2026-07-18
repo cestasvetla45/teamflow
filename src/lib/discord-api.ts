@@ -131,6 +131,57 @@ export async function removeRole(guildId: string, userId: string, roleId: string
   await discordCall('DELETE', `/guilds/${guildId}/members/${userId}/roles/${roleId}`)
 }
 
+export interface DiscordGuild {
+  id: string
+  name: string
+  owner_id: string
+}
+
+/** Used for the "guild owner is always an admin" fallback in the admin gate. */
+export async function getGuild(guildId: string): Promise<DiscordGuild> {
+  return discordCall<DiscordGuild>('GET', `/guilds/${guildId}`)
+}
+
+// ─── Message chunking (Discord's hard cap is 2000 chars per message) ──────
+const DISCORD_CHUNK_LIMIT = 1900
+
+/** Splits long text on paragraph breaks (falling back to hard slicing) so no chunk exceeds the limit. */
+export function chunkDiscordMessage(text: string, limit: number = DISCORD_CHUNK_LIMIT): string[] {
+  if (text.length <= limit) return [text]
+
+  const chunks: string[] = []
+  let current = ''
+  for (const paragraph of text.split('\n\n')) {
+    const candidate = current ? `${current}\n\n${paragraph}` : paragraph
+    if (candidate.length > limit) {
+      if (current) chunks.push(current)
+      if (paragraph.length > limit) {
+        // A single paragraph is itself too long — hard-slice it.
+        for (let i = 0; i < paragraph.length; i += limit) chunks.push(paragraph.slice(i, i + limit))
+        current = ''
+      } else {
+        current = paragraph
+      }
+    } else {
+      current = candidate
+    }
+  }
+  if (current) chunks.push(current)
+  return chunks
+}
+
+/** Sends a DM to a Discord user by id — opens/reuses a DM channel then posts the message. */
+export async function sendDiscordDM(discordId: string, text: string): Promise<void> {
+  try {
+    const channel = await createDmChannel(discordId)
+    for (const chunk of chunkDiscordMessage(text)) {
+      await sendMessage(channel.id, chunk)
+    }
+  } catch (err) {
+    console.error(`Failed to send Discord DM to ${discordId}:`, err)
+  }
+}
+
 // ─── Slash command registration ────────────────────────────────────────────
 // Plain REST JSON — no discord.js Client/gateway needed since we never hold a
 // persistent connection (interactions arrive via the webhook route instead).
@@ -205,6 +256,174 @@ const SLASH_COMMANDS = [
   },
   { name: 'setup', description: 'Auto-create server structure (admin) — creates channels, roles, categories' },
   { name: 'help', description: 'Show all commands' },
+
+  // ── Tasks (admin, mirrors ai/tools.ts) ──────────────────────────────────
+  {
+    name: 'task',
+    description: 'Show full details on any task, including attachments and activity',
+    options: [{ name: 'query', description: 'Task title or id prefix', type: 3, required: true }],
+  },
+  {
+    name: 'complete',
+    description: 'Mark any task as done (admin)',
+    options: [{ name: 'query', description: 'Task title or id prefix', type: 3, required: true }],
+  },
+  {
+    name: 'assign',
+    description: 'Assign a task to a member (admin)',
+    options: [
+      { name: 'query', description: 'Task title or id prefix', type: 3, required: true },
+      { name: 'member', description: 'Member to assign', type: 6, required: true },
+    ],
+  },
+  {
+    name: 'reassign',
+    description: 'Reassign a task to a different member (admin)',
+    options: [
+      { name: 'query', description: 'Task title or id prefix', type: 3, required: true },
+      { name: 'member', description: 'Member to assign', type: 6, required: true },
+    ],
+  },
+  {
+    name: 'update',
+    description: 'Update fields on a task (admin)',
+    options: [
+      { name: 'query', description: 'Task title or id prefix', type: 3, required: true },
+      { name: 'title', description: 'New title', type: 3, required: false },
+      { name: 'description', description: 'New description', type: 3, required: false },
+      { name: 'priority', description: 'Priority', type: 3, required: false, choices: ['low', 'medium', 'high', 'urgent'].map((v) => ({ name: v, value: v })) },
+      { name: 'platform', description: 'Platform', type: 3, required: false, choices: ['twitter', 'reddit', 'instagram', 'tiktok', 'youtube'].map((v) => ({ name: v, value: v })) },
+      { name: 'status', description: 'Status', type: 3, required: false, choices: ['todo', 'in_progress', 'review', 'done', 'blocked'].map((v) => ({ name: v, value: v })) },
+      { name: 'due_date', description: 'Natural date like "tomorrow" or an ISO date', type: 3, required: false },
+      { name: 'estimated_hours', description: 'Estimated hours', type: 10, required: false },
+      { name: 'assignee', description: 'Reassign to', type: 6, required: false },
+    ],
+  },
+  {
+    name: 'deltask',
+    description: 'Permanently delete a task (admin)',
+    options: [{ name: 'query', description: 'Task title or id prefix', type: 3, required: true }],
+  },
+  {
+    name: 'attach',
+    description: 'Attach a link to a task (admin)',
+    options: [
+      { name: 'query', description: 'Task title or id prefix', type: 3, required: true },
+      { name: 'url', description: 'Link URL', type: 3, required: true },
+      { name: 'title', description: 'Attachment title', type: 3, required: false },
+    ],
+  },
+  {
+    name: 'attachments',
+    description: 'List attachments on a task (admin)',
+    options: [{ name: 'query', description: 'Task title or id prefix', type: 3, required: true }],
+  },
+  {
+    name: 'recurring',
+    description: 'Make a task recur on a schedule (admin)',
+    options: [
+      { name: 'query', description: 'Task title or id prefix', type: 3, required: true },
+      { name: 'pattern', description: 'Recurrence pattern', type: 3, required: true, choices: ['daily', 'weekly', 'weekday'].map((v) => ({ name: v, value: v })) },
+    ],
+  },
+  {
+    name: 'stoprecurring',
+    description: 'Stop a task from recurring (admin)',
+    options: [{ name: 'query', description: 'Task title or id prefix', type: 3, required: true }],
+  },
+  {
+    name: 'search',
+    description: 'Search tasks by title or description',
+    options: [{ name: 'query', description: 'Search text', type: 3, required: true }],
+  },
+
+  // ── Members / skills (admin) ────────────────────────────────────────────
+  { name: 'members', description: 'List all team members (admin)' },
+  {
+    name: 'member',
+    description: 'Get full details on one member (admin)',
+    options: [{ name: 'user', description: 'Member', type: 6, required: true }],
+  },
+  { name: 'skills', description: 'List the skills catalog (admin)' },
+  {
+    name: 'addskill',
+    description: 'Assign a skill to a member (admin)',
+    options: [
+      { name: 'member', description: 'Member', type: 6, required: true },
+      { name: 'skill', description: 'Skill name', type: 3, required: true },
+      { name: 'proficiency', description: '1-5, defaults to 3', type: 4, required: false },
+    ],
+  },
+  {
+    name: 'removeskill',
+    description: 'Remove a skill from a member (admin)',
+    options: [
+      { name: 'member', description: 'Member', type: 6, required: true },
+      { name: 'skill', description: 'Skill name', type: 3, required: true },
+    ],
+  },
+
+  // ── Boards (admin) ──────────────────────────────────────────────────────
+  { name: 'boards', description: 'List all task boards (admin)' },
+  {
+    name: 'addboard',
+    description: 'Create a new task board (admin)',
+    options: [
+      { name: 'name', description: 'Board name', type: 3, required: true },
+      { name: 'description', description: 'Board description', type: 3, required: false },
+    ],
+  },
+
+  // ── Insight ──────────────────────────────────────────────────────────────
+  { name: 'stats', description: 'Team-wide stats: tasks by status, overdue, completed today/this week (admin)' },
+  { name: 'workload', description: "Every active member's booked vs max hours (admin)" },
+  {
+    name: 'free',
+    description: 'Recommend the best available member, optionally by skill',
+    options: [{ name: 'skill', description: 'Skill name', type: 3, required: false }],
+  },
+
+  // ── Reel Lab bridge ──────────────────────────────────────────────────────
+  {
+    name: 'vatodo',
+    description: 'Show the Instagram VA daily checklist',
+    options: [{ name: 'handle', description: 'Account handle', type: 3, required: false }],
+  },
+  {
+    name: 'logreel',
+    description: 'Log a posted Instagram reel/post',
+    options: [
+      { name: 'url', description: 'Instagram reel/post URL', type: 3, required: true },
+      { name: 'handle', description: 'Account handle (defaults to your active assignment)', type: 3, required: false },
+    ],
+  },
+
+  // ── Vault / self-service ─────────────────────────────────────────────────
+  { name: 'myvault', description: 'List your own vault items' },
+  {
+    name: 'pause',
+    description: 'Move one of your tasks back to To Do',
+    options: [{ name: 'id', description: 'Task ID prefix', type: 3, required: true }],
+  },
+
+  // ── Topic access (admin) ────────────────────────────────────────────────
+  {
+    name: 'granttopic',
+    description: 'Grant a team access to a topic (admin)',
+    options: [
+      { name: 'topic', description: 'Topic name', type: 3, required: true },
+      { name: 'team', description: 'Team name', type: 3, required: true },
+    ],
+  },
+  {
+    name: 'revoketopic',
+    description: "Revoke a team's access to a topic (admin)",
+    options: [
+      { name: 'topic', description: 'Topic name', type: 3, required: true },
+      { name: 'team', description: 'Team name', type: 3, required: true },
+    ],
+  },
+  { name: 'topicaccess', description: 'List which teams have access to which topics (admin)' },
 ]
 
 export async function registerSlashCommands(guildId: string): Promise<void> {

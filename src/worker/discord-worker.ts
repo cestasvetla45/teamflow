@@ -1,10 +1,12 @@
 import { Client, GatewayIntentBits, Partials, Message, Guild, GuildMember } from 'discord.js'
 import WebSocket from 'ws'
 import { createAdminClient } from '@/lib/supabase/admin'
-import { generateAIResponse, generateAIResponseWithFile } from '@/lib/bot-ai'
+import { runAssistant } from '@/lib/ai'
+import { executeTool } from '@/lib/ai/tools'
 import { extractFileContent } from '@/lib/file-reader'
 import { canAccessTopicForDiscordUser, getTopicNameFromDiscordChannel } from '@/lib/topic-access'
 import { ensureDiscordMemberExists, getMemberByDiscordId } from '@/lib/teamflow-db'
+import type { TfMember } from '@/types/teamflow'
 
 // Polyfill WebSocket for Node 18 (Supabase realtime needs it)
 ;(globalThis as unknown as { WebSocket: unknown }).WebSocket = WebSocket
@@ -14,7 +16,6 @@ if (!process.env.DISCORD_BOT_TOKEN) {
 }
 
 const BOT_ID = process.env.DISCORD_BOT_ID || '1527663610485018684'
-const BOT_MENTION_RE = new RegExp(`<@!?${BOT_ID}>`, 'g')
 const BOT_COMMANDS_CHANNEL = 'bot-commands'
 const DISCORD_MESSAGE_LIMIT = 2000
 
@@ -83,10 +84,69 @@ async function lockdownChannels(guild: Guild) {
   console.log(`Lockdown pass complete — @everyone denied on ${PRIVATE_CHANNELS.size} private channels`)
 }
 
-function isDiscordAdmin(message: Message<true>): boolean {
+// Channels that bypass topic access control entirely — anyone with server access can use the bot here.
+const PUBLIC_BYPASS_CHANNELS = new Set(['bot-commands', 'general', 'testing'])
+
+// Admin gate: env-configured admin id, guild owner, tf_members.role='admin', or the legacy "Full Manager" role.
+async function isDiscordAdmin(message: Message<true>): Promise<boolean> {
   const adminId = process.env.ADMIN_DISCORD_ID
   if (adminId && message.author.id === adminId) return true
+  if (message.guild.ownerId === message.author.id) return true
+
+  const tfMember = await getMemberByDiscordId(supabase, message.author.id)
+  if (tfMember?.role === 'admin') return true
+
   return message.member?.roles.cache.some((role) => role.name === 'Full Manager') ?? false
+}
+
+// TASK_27 — auto-detect Instagram reel/post links pasted into any channel.
+const REEL_URL_RE = /https?:\/\/(?:www\.)?instagram\.com\/(?:reel|p)\/[A-Za-z0-9_-]+[^\s]*/i
+
+function extractReelUrl(text: string): string | null {
+  const match = text.match(REEL_URL_RE)
+  return match ? match[0] : null
+}
+
+// "essentially just the link" — at most one other non-empty line besides the one carrying the URL.
+function isJustTheLink(text: string, url: string): boolean {
+  const lines = text
+    .split('\n')
+    .map((l) => l.trim())
+    .filter(Boolean)
+  const nonUrlLines = lines.filter((l) => !l.includes(url))
+  return nonUrlLines.length <= 1
+}
+
+// Resolves raw `<@123>` / `<@!123>` mentions to `@username` via the guild member cache/fetch,
+// and strips the bot's own mention entirely. Run BEFORE any text reaches the AI core.
+async function resolveMentionsToUsernames(message: Message<true>): Promise<string> {
+  const mentionRe = /<@!?(\d+)>/g
+  const ids = new Set<string>()
+  let match: RegExpExecArray | null
+  while ((match = mentionRe.exec(message.content))) {
+    if (match[1] !== BOT_ID) ids.add(match[1])
+  }
+
+  const nameById = new Map<string, string>()
+  for (const id of ids) {
+    let guildMember = message.guild.members.cache.get(id)
+    if (!guildMember) {
+      try {
+        guildMember = await message.guild.members.fetch(id)
+      } catch {
+        guildMember = undefined
+      }
+    }
+    if (guildMember) nameById.set(id, guildMember.displayName || guildMember.user.username)
+  }
+
+  return message.content
+    .replace(mentionRe, (full, id: string) => {
+      if (id === BOT_ID) return ''
+      const name = nameById.get(id)
+      return name ? `@${name}` : full
+    })
+    .trim()
 }
 
 async function isReplyFromBot(message: Message<true>): Promise<boolean> {
@@ -124,6 +184,43 @@ async function sendDiscordReply(message: Message<true>, text: string): Promise<v
   }
 }
 
+// TASK_27 — handles a message containing an Instagram reel/post link: if it's essentially just
+// the link, log it directly via the log_reel_post tool executor; otherwise route the full message
+// through the assistant with a hint so it can decide whether/how to log it in context.
+async function handleReelLinkMessage(
+  message: Message<true>,
+  resolvedText: string,
+  reelUrl: string,
+  member: TfMember,
+  admin: boolean
+): Promise<void> {
+  await message.channel.sendTyping()
+  const chatKey = `dc:${message.channelId}:${message.author.id}`
+
+  try {
+    if (isJustTheLink(resolvedText, reelUrl)) {
+      const result = await executeTool('log_reel_post', { reel_url: reelUrl }, { isAdmin: admin, sender: member })
+      await sendDiscordReply(message, result)
+      return
+    }
+
+    const channelContext = `The user is messaging from the #${message.channel.name} channel on Discord.`
+    const hint =
+      '[This message includes an Instagram reel/post link. If the user is reporting that they posted it, log it with the reel-logging tool.]'
+    const aiReply = await runAssistant({
+      text: `${channelContext}\n${hint}\n${resolvedText}`,
+      channel: 'discord',
+      chatKey,
+      sender: member,
+      isAdmin: admin,
+    })
+    await sendDiscordReply(message, aiReply)
+  } catch (err) {
+    console.error('Failed to process reel link message:', err)
+    await message.reply('Sorry, I had trouble logging that reel link.')
+  }
+}
+
 client.on('messageCreate', async (message: Message) => {
   if (message.author.bot) return
   if (!message.inGuild()) return // DMs aren't supported — the bot only operates inside the TeamFlow server
@@ -132,20 +229,22 @@ client.on('messageCreate', async (message: Message) => {
   const isBotCommandsChannel = channelName === BOT_COMMANDS_CHANNEL
   const isMentioned = message.mentions.has(BOT_ID)
   const isReplyToBot = await isReplyFromBot(message)
+  const reelUrl = extractReelUrl(message.content)
 
-  if (!isMentioned && !isReplyToBot && !isBotCommandsChannel) return
+  // Reel-link auto-detect fires independently of the mention gate below (a VA posting a reel
+  // link in a platform channel isn't mentioning the bot). Everything else stays mention-gated.
+  if (!reelUrl && !isMentioned && !isReplyToBot && !isBotCommandsChannel) return
 
-  const text = message.content.replace(BOT_MENTION_RE, '').trim()
-  if (!text && message.attachments.size === 0) return
+  const admin = await isDiscordAdmin(message)
 
-  const admin = isDiscordAdmin(message)
-
-  if (!admin) {
+  if (!admin && !PUBLIC_BYPASS_CHANNELS.has(channelName)) {
     const topicName = await getTopicNameFromDiscordChannel(message.channelId)
     if (topicName) {
       const access = await canAccessTopicForDiscordUser(message.author.id, topicName)
       if (!access.allowed) {
-        await message.reply(`🚫 ${access.reason}`)
+        // Only talk back if the user actually engaged the bot — stay quiet on a bare reel
+        // link posted in a channel the sender isn't authorized for.
+        if (isMentioned || isReplyToBot || isBotCommandsChannel) await message.reply(`🚫 ${access.reason}`)
         return
       }
     }
@@ -157,10 +256,20 @@ client.on('messageCreate', async (message: Message) => {
     discord_username: message.author.username,
   })
 
+  const resolvedText = await resolveMentionsToUsernames(message)
+
+  if (reelUrl) {
+    await handleReelLinkMessage(message, resolvedText, reelUrl, member, admin)
+    return
+  }
+
+  if (!resolvedText && message.attachments.size === 0) return
+
   await message.channel.sendTyping()
 
   const channelContext = `The user is messaging from the #${channelName} channel on Discord.`
-  const promptText = `${channelContext}\n${text || 'What should I do with this file?'}`
+  const promptText = `${channelContext}\n${resolvedText || 'What should I do with this file?'}`
+  const chatKey = `dc:${message.channelId}:${message.author.id}`
 
   try {
     if (message.attachments.size > 0) {
@@ -171,18 +280,27 @@ client.on('messageCreate', async (message: Message) => {
       const content = await extractFileContent(buffer, attachment.name, mimeType)
       const isImage = mimeType.startsWith('image/')
 
-      const aiReply = await generateAIResponseWithFile(
-        promptText,
-        content,
-        isImage ? buffer.toString('base64') : undefined,
-        isImage ? mimeType : undefined,
-        { sender: member, isAdmin: admin }
-      )
+      const aiReply = await runAssistant({
+        text: promptText,
+        channel: 'discord',
+        chatKey,
+        sender: member,
+        isAdmin: admin,
+        fileContent: content,
+        imageBase64: isImage ? buffer.toString('base64') : undefined,
+        imageMimeType: isImage ? mimeType : undefined,
+      })
       await sendDiscordReply(message, aiReply)
       return
     }
 
-    const aiReply = await generateAIResponse(`${channelContext}\n${text}`, { sender: member, isAdmin: admin })
+    const aiReply = await runAssistant({
+      text: `${channelContext}\n${resolvedText}`,
+      channel: 'discord',
+      chatKey,
+      sender: member,
+      isAdmin: admin,
+    })
     await sendDiscordReply(message, aiReply)
   } catch (err) {
     console.error('Failed to process Discord message:', err)

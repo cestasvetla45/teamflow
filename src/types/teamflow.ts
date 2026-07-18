@@ -47,6 +47,8 @@ export interface TfBoard {
   created_at: string
 }
 
+export type RecurrencePattern = 'daily' | 'weekly' | 'weekday'
+
 export interface TfTask {
   id: string
   title: string
@@ -63,8 +65,26 @@ export interface TfTask {
   actual_hours: number | null
   tags: string[]
   platform: Platform | null
+  is_recurring: boolean
+  recurrence_pattern: RecurrencePattern | null
+  recurrence_parent_id: string | null
   created_at: string
   updated_at: string
+}
+
+export type TaskAttachmentType = 'link'
+
+export interface TfTaskAttachment {
+  id: string
+  task_id: string
+  type: TaskAttachmentType
+  title: string | null
+  url: string
+  file_name: string | null
+  mime_type: string | null
+  file_size: number | null
+  uploaded_by: string | null
+  created_at: string
 }
 
 export interface TfTaskActivity {
@@ -184,4 +204,14 @@ export interface TfTopicTeamAccess {
   topic_name: string
   team_id: string
   created_at: string
+}
+
+export type AiChannel = 'telegram' | 'discord'
+
+export interface TfConversation {
+  id: string
+  channel: AiChannel
+  chat_key: string
+  messages: unknown
+  updated_at: string
 }
