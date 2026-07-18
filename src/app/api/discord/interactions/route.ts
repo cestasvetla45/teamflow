@@ -1,7 +1,11 @@
 import { NextRequest, NextResponse } from 'next/server'
 import nacl from 'tweetnacl'
-import { dispatchCommand, type DiscordInteraction } from '@/lib/discord-commands'
+import { dispatchCommand, GIF_URL, type DiscordInteraction } from '@/lib/discord-commands'
 import { chunkDiscordMessage } from '@/lib/discord-api'
+
+// Commands whose reply should be a normal, visible-to-everyone channel message
+// rather than the default ephemeral (flags: 64) response.
+const NON_EPHEMERAL_COMMANDS = new Set(['gif'])
 
 export const runtime = 'nodejs'
 
@@ -61,6 +65,17 @@ export async function POST(req: NextRequest) {
     return NextResponse.json({ type: 1 })
   }
 
+  // MESSAGE_COMPONENT (e.g. the /gifbutton "Send" button) — handled independently of
+  // command dispatch since it has no command name, only a custom_id.
+  if (interaction.type === 3) {
+    const customId = interaction.data?.custom_id
+    if (customId === 'send_gif') {
+      // Not ephemeral — the whole channel should see the GIF.
+      return NextResponse.json({ type: 4, data: { content: GIF_URL } })
+    }
+    return NextResponse.json({ type: 4, data: { content: 'Unknown button', flags: 64 } })
+  }
+
   if (interaction.type !== 2) {
     return NextResponse.json({ error: 'Unhandled interaction type' }, { status: 400 })
   }
@@ -93,7 +108,8 @@ export async function POST(req: NextRequest) {
       })()
     }
 
-    return NextResponse.json({ type: 4, data: { content: first, flags: 64 } })
+    const isEphemeral = !NON_EPHEMERAL_COMMANDS.has(interaction.data.name)
+    return NextResponse.json({ type: 4, data: isEphemeral ? { content: first, flags: 64 } : { content: first } })
   } catch (err) {
     console.error('Discord command failed:', err)
     return NextResponse.json({

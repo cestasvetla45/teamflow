@@ -1,6 +1,6 @@
 import { createAdminClient } from '@/lib/supabase/admin'
 import { setupDiscordServer } from '@/lib/discord-setup'
-import { assignRole, getGuild } from '@/lib/discord-api'
+import { assignRole, getGuild, sendMessage } from '@/lib/discord-api'
 import { getMemberWorkload } from '@/lib/workload'
 import { listSOPs } from '@/lib/sops'
 import { notifyTaskAssigned, notifyTaskCompleted } from '@/lib/teamflow-db'
@@ -16,6 +16,10 @@ import { executeTool, type ToolContext } from '@/lib/ai/tools'
 import type { Platform, TaskPriority, TfMember, TfSop, TfTask, TfTeam } from '@/types/teamflow'
 
 const supabase = createAdminClient()
+
+// GIF-button feature — single source of truth for the URL so it's changeable in one place.
+export const GIF_URL =
+  'https://media3.giphy.com/media/v1.Y2lkPTc5MGI3NjExOGJ4OXNoZnd0M2xmMTc1eG11NG9mY3BmcHAwcXAydDYxanQ5OHZvcSZlcD12MV9pbnRlcm5hbF9naWZfYnlfaWQmY3Q9Zw/NpsofYoHrC8mg8DjOu/giphy.gif'
 
 // ─── Interaction payload shape (only the fields we use) ───────────────────
 export interface DiscordOption {
@@ -39,12 +43,14 @@ export interface DiscordInteraction {
   data: {
     name: string
     options?: DiscordOption[]
+    custom_id?: string
     resolved?: {
       users?: Record<string, DiscordResolvedUser>
       roles?: Record<string, DiscordResolvedRole>
     }
   }
   guild_id?: string
+  channel_id?: string
   member?: { user: DiscordResolvedUser }
   user?: DiscordResolvedUser
 }
@@ -206,6 +212,10 @@ Or just talk to me naturally (@mention me, or type in #bot-commands) — I can d
 
 **Boards & insight (admin)**
 /boards, /addboard, /stats, /workload, /free [skill]
+
+**Fun**
+/gif — post a GIF
+/gifbutton — post a persistent button that sends the GIF (admin)
 
 **Setup**
 /setup — auto-create server structure (admin)
@@ -633,6 +643,29 @@ export async function handleSetupCommand(interaction: DiscordInteraction): Promi
   ].join('\n')
 }
 
+// ─── Fun ─────────────────────────────────────────────────────────────────
+
+/** /gif — the interactions route responds directly with GIF_URL as non-ephemeral content; this exists for dispatch/help consistency. */
+export async function handleGif(): Promise<string> {
+  return GIF_URL
+}
+
+/** /gifbutton (admin) — posts a persistent channel message with a "Send" button (custom_id "send_gif"). */
+export async function handleGifButton(interaction: DiscordInteraction): Promise<string> {
+  if (!interaction.channel_id) return 'This command must be run in a channel, not a DM.'
+
+  await sendMessage(interaction.channel_id, 'Push it.', undefined, [
+    {
+      type: 1, // ACTION_ROW
+      components: [
+        { type: 2, style: 1, label: '📤 Send', custom_id: 'send_gif' }, // BUTTON, PRIMARY
+      ],
+    },
+  ])
+
+  return '✅ Posted the GIF button.'
+}
+
 // ─── Tool-backed handlers ───────────────────────────────────────────────────
 // These delegate to ai/tools.ts's shared executors — the same code path
 // natural-language requests use — so slash commands and chat stay consistent,
@@ -811,7 +844,7 @@ export async function handleTopicAccessList(interaction: DiscordInteraction): Pr
 
 // ─── Dispatcher ─────────────────────────────────────────────────────────────
 
-const ADMIN_ONLY_COMMANDS = new Set(['addtask', 'addmember', 'addteam', 'assignrole', 'setup'])
+const ADMIN_ONLY_COMMANDS = new Set(['addtask', 'addmember', 'addteam', 'assignrole', 'setup', 'gifbutton'])
 
 export async function dispatchCommand(interaction: DiscordInteraction): Promise<string> {
   const name = interaction.data.name
@@ -856,6 +889,10 @@ export async function dispatchCommand(interaction: DiscordInteraction): Promise<
       return handleAssignRole(interaction)
     case 'setup':
       return handleSetupCommand(interaction)
+    case 'gif':
+      return handleGif()
+    case 'gifbutton':
+      return handleGifButton(interaction)
     case 'task':
       return handleTaskDetails(interaction)
     case 'complete':

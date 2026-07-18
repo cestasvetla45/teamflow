@@ -114,9 +114,10 @@ export async function createDmChannel(userId: string): Promise<DiscordChannel> {
 export async function sendMessage(
   channelId: string,
   content: string,
-  embeds?: unknown[]
+  embeds?: unknown[],
+  components?: unknown[]
 ): Promise<{ id: string }> {
-  return discordCall<{ id: string }>('POST', `/channels/${channelId}/messages`, { content, embeds })
+  return discordCall<{ id: string }>('POST', `/channels/${channelId}/messages`, { content, embeds, components })
 }
 
 export async function editMessage(channelId: string, messageId: string, content: string): Promise<void> {
@@ -256,6 +257,10 @@ const SLASH_COMMANDS = [
   },
   { name: 'setup', description: 'Auto-create server structure (admin) — creates channels, roles, categories' },
   { name: 'help', description: 'Show all commands' },
+
+  // ── Fun ──────────────────────────────────────────────────────────────────
+  { name: 'gif', description: 'Post a GIF' },
+  { name: 'gifbutton', description: 'Post a persistent button that sends the GIF (admin)' },
 
   // ── Tasks (admin, mirrors ai/tools.ts) ──────────────────────────────────
   {
