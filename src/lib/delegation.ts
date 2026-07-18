@@ -8,6 +8,7 @@ export interface AssigneeCandidate {
   available_hours: number
   current_tasks: number
   utilization_pct: number
+  tasks_without_estimate: number
   recommendation_score: number
   reason: string
 }
@@ -72,6 +73,7 @@ export async function findBestAssignee(
       available_hours: workload.available_hours,
       current_tasks: workload.active_tasks,
       utilization_pct: workload.utilization_pct,
+      tasks_without_estimate: workload.tasks_without_estimate,
       recommendation_score: 0,
       reason: '',
     }
@@ -97,6 +99,9 @@ export async function findBestAssignee(
     }
     reasonParts.push(`${candidate.available_hours}h available today`)
     reasonParts.push(`${candidate.current_tasks} active task${candidate.current_tasks === 1 ? '' : 's'}`)
+    if (candidate.tasks_without_estimate > 0) {
+      reasonParts.push(`${candidate.tasks_without_estimate} without a time estimate`)
+    }
 
     return {
       ...candidate,

@@ -32,6 +32,8 @@ export interface TeamContextMember {
   teams: string[]
   active_task_count: number
   hours_booked: number
+  /** Active tasks with no estimated_hours set — hours_booked understates real load when this is > 0. */
+  tasks_without_estimate: number
 }
 
 export interface TeamContextTask {
@@ -107,6 +109,7 @@ export async function buildTeamContext(senderId?: string | null): Promise<TeamCo
       .map((ms) => `${ms.skill?.name} (${ms.proficiency_level}/5)`)
     const activeTasks = allTasks.filter((t) => t.assignee_id === m.id && t.status !== 'done')
     const bookedHours = activeTasks.reduce((sum, t) => sum + (t.estimated_hours ?? 0), 0)
+    const unestimatedCount = activeTasks.filter((t) => t.estimated_hours == null).length
     const memberTeamIds = allMemberTeams.filter((mt) => mt.member_id === m.id).map((mt) => mt.team_id)
     const memberTeamNames = allTeams.filter((t) => memberTeamIds.includes(t.id)).map((t) => t.name)
     return {
@@ -121,6 +124,7 @@ export async function buildTeamContext(senderId?: string | null): Promise<TeamCo
       teams: memberTeamNames,
       active_task_count: activeTasks.length,
       hours_booked: Math.round(bookedHours * 100) / 100,
+      tasks_without_estimate: unestimatedCount,
     }
   })
 

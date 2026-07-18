@@ -117,8 +117,11 @@ function isJustTheLink(text: string, url: string): boolean {
   return nonUrlLines.length <= 1
 }
 
-// Resolves raw `<@123>` / `<@!123>` mentions to `@username` via the guild member cache/fetch,
-// and strips the bot's own mention entirely. Run BEFORE any text reaches the AI core.
+// Resolves raw `<@123>` / `<@!123>` mentions to `@name` — preferring the linked tf_members.name
+// (so the AI sees the real name it knows the person by, e.g. "Adam Sahiboh" instead of a raw
+// Discord username like "04022023"), falling back to the guild member cache/fetch's displayName,
+// then the raw Discord username. Strips the bot's own mention entirely. Run BEFORE any text
+// reaches the AI core.
 async function resolveMentionsToUsernames(message: Message<true>): Promise<string> {
   const mentionRe = /<@!?(\d+)>/g
   const ids = new Set<string>()
@@ -129,6 +132,12 @@ async function resolveMentionsToUsernames(message: Message<true>): Promise<strin
 
   const nameById = new Map<string, string>()
   for (const id of ids) {
+    const tfMember = await getMemberByDiscordId(supabase, id)
+    if (tfMember?.name) {
+      nameById.set(id, tfMember.name)
+      continue
+    }
+
     let guildMember = message.guild.members.cache.get(id)
     if (!guildMember) {
       try {
@@ -149,14 +158,29 @@ async function resolveMentionsToUsernames(message: Message<true>): Promise<strin
     .trim()
 }
 
-async function isReplyFromBot(message: Message<true>): Promise<boolean> {
-  if (!message.reference?.messageId) return false
+const REPLY_CONTEXT_MAX_CHARS = 300
+
+/** Fetches the message this one is replying to, if any. Returns null if there's no reference or the fetch fails. */
+async function fetchReferencedMessage(message: Message<true>): Promise<Message<true> | null> {
+  if (!message.reference?.messageId) return null
   try {
-    const referenced = await message.channel.messages.fetch(message.reference.messageId)
-    return referenced.author.id === BOT_ID
-  } catch {
-    return false
+    return await message.channel.messages.fetch(message.reference.messageId)
+  } catch (err) {
+    console.error('Failed to fetch referenced message for reply context:', err)
+    return null
   }
+}
+
+/**
+ * When a message is a reply, prior conversation memory alone isn't enough context for follow-ups
+ * like "did you mark it as done?" — the assistant needs to know what "it" refers to. Prepends the
+ * referenced message's content (truncated) so runAssistant sees it as part of the current turn.
+ */
+function buildReplyContextPrefix(referenced: Message<true> | null): string {
+  const content = referenced?.content?.trim()
+  if (!content) return ''
+  const truncated = content.length > REPLY_CONTEXT_MAX_CHARS ? `${content.slice(0, REPLY_CONTEXT_MAX_CHARS)}…` : content
+  return `[Replying to your earlier message: "${truncated}"]\n`
 }
 
 // Splits on paragraph breaks so a long AI reply doesn't get cut mid-sentence — Discord caps messages at 2000 chars.
@@ -192,7 +216,8 @@ async function handleReelLinkMessage(
   resolvedText: string,
   reelUrl: string,
   member: TfMember,
-  admin: boolean
+  admin: boolean,
+  replyPrefix: string
 ): Promise<void> {
   await message.channel.sendTyping()
   const chatKey = `dc:${message.channelId}:${message.author.id}`
@@ -208,7 +233,7 @@ async function handleReelLinkMessage(
     const hint =
       '[This message includes an Instagram reel/post link. If the user is reporting that they posted it, log it with the reel-logging tool.]'
     const aiReply = await runAssistant({
-      text: `${channelContext}\n${hint}\n${resolvedText}`,
+      text: `${replyPrefix}${channelContext}\n${hint}\n${resolvedText}`,
       channel: 'discord',
       chatKey,
       sender: member,
@@ -228,7 +253,9 @@ client.on('messageCreate', async (message: Message) => {
   const channelName = message.channel.name
   const isBotCommandsChannel = channelName === BOT_COMMANDS_CHANNEL
   const isMentioned = message.mentions.has(BOT_ID)
-  const isReplyToBot = await isReplyFromBot(message)
+  const referencedMessage = await fetchReferencedMessage(message)
+  const isReplyToBot = referencedMessage?.author.id === BOT_ID
+  const replyPrefix = buildReplyContextPrefix(referencedMessage)
   const reelUrl = extractReelUrl(message.content)
 
   // Reel-link auto-detect fires independently of the mention gate below (a VA posting a reel
@@ -259,7 +286,7 @@ client.on('messageCreate', async (message: Message) => {
   const resolvedText = await resolveMentionsToUsernames(message)
 
   if (reelUrl) {
-    await handleReelLinkMessage(message, resolvedText, reelUrl, member, admin)
+    await handleReelLinkMessage(message, resolvedText, reelUrl, member, admin, replyPrefix)
     return
   }
 
@@ -268,7 +295,7 @@ client.on('messageCreate', async (message: Message) => {
   await message.channel.sendTyping()
 
   const channelContext = `The user is messaging from the #${channelName} channel on Discord.`
-  const promptText = `${channelContext}\n${resolvedText || 'What should I do with this file?'}`
+  const promptText = `${replyPrefix}${channelContext}\n${resolvedText || 'What should I do with this file?'}`
   const chatKey = `dc:${message.channelId}:${message.author.id}`
 
   try {
@@ -295,7 +322,7 @@ client.on('messageCreate', async (message: Message) => {
     }
 
     const aiReply = await runAssistant({
-      text: `${channelContext}\n${resolvedText}`,
+      text: `${replyPrefix}${channelContext}\n${resolvedText}`,
       channel: 'discord',
       chatKey,
       sender: member,

@@ -12,6 +12,8 @@ export interface WorkloadInfo {
   utilization_pct: number
   available_hours: number
   status: WorkloadStatus
+  /** Count of active tasks with no estimated_hours set — hours_remaining understates real load when this is > 0. */
+  tasks_without_estimate: number
 }
 
 export type WorkloadLog = Database['public']['Tables']['tf_workload_log']['Row']
@@ -27,7 +29,7 @@ function computeStatus(utilizationPct: number): WorkloadStatus {
 
 function buildWorkloadInfo(
   member: { id: string; name: string; max_daily_hours: number | null },
-  activeTaskSummary: { count: number; hours: number } | undefined
+  activeTaskSummary: { count: number; hours: number; unestimated: number } | undefined
 ): WorkloadInfo {
   const maxDailyHours = member.max_daily_hours ?? 8
   const activeTasks = activeTaskSummary?.count ?? 0
@@ -45,19 +47,21 @@ function buildWorkloadInfo(
     utilization_pct: utilizationPct,
     available_hours: availableHours,
     status: computeStatus(utilizationPct),
+    tasks_without_estimate: activeTaskSummary?.unestimated ?? 0,
   }
 }
 
 function summarizeTasks(
   tasks: { estimated_hours: number | null; actual_hours: number | null }[]
-): { count: number; hours: number } {
+): { count: number; hours: number; unestimated: number } {
   return tasks.reduce(
     (acc, task) => {
       acc.count += 1
       acc.hours += Math.max(0, (task.estimated_hours ?? 0) - (task.actual_hours ?? 0))
+      if (task.estimated_hours == null) acc.unestimated += 1
       return acc
     },
-    { count: 0, hours: 0 }
+    { count: 0, hours: 0, unestimated: 0 }
   )
 }
 

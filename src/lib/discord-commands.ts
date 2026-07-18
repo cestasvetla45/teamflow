@@ -96,11 +96,14 @@ async function ensureDiscordMemberExists(user: DiscordResolvedUser): Promise<TfM
 
   const { data, error } = await supabase
     .from('tf_members')
-    .insert({ discord_id: user.id, name: displayName(user) })
+    .insert({ discord_id: user.id, name: displayName(user), discord_username: user.username })
     .select('*')
     .single()
 
-  if (error || !data) throw new Error(`Failed to auto-register member: ${error?.message}`)
+  if (error || !data) {
+    console.error('Failed to auto-register Discord member:', error)
+    throw new Error(`Failed to auto-register member: ${error?.message}`)
+  }
   return data as TfMember
 }
 

@@ -37,7 +37,7 @@ import { syncMembersToReelLab, formatVaSyncResult } from '@/lib/va-sync'
 import { getMemberWorkload, getTeamWorkload } from '@/lib/workload'
 import { getTaskActivity } from '@/lib/activity'
 import { notifyMemberAssigned } from './notify-helpers'
-import { parseNaturalDate } from './dates'
+import { parseNaturalDate, todayLabel } from './dates'
 import { buildTeamContext } from './context'
 import type { FunctionDeclaration } from './gemini'
 
@@ -73,22 +73,52 @@ const RECURRENCE_PATTERNS = ['daily', 'weekly', 'weekday']
 
 // ─── Reference resolvers ───────────────────────────────────────────────────────
 
-/** Matches a member by name, telegram_username, or discord_username — case-insensitive, @-tolerant. */
+/** Escapes ilike wildcard characters so a raw name/username can't accidentally act as a pattern. */
+function escapeIlike(value: string): string {
+  return value.replace(/[%_,()]/g, (c) => `\\${c}`)
+}
+
+/**
+ * Matches a member by name, telegram_username, or discord_username — case-insensitive, @-tolerant.
+ * Tries an exact (whole-field) match first, then falls back to a substring/word match across all
+ * three fields, e.g. "sahiboh" matches name "Adam Sahiboh" AND discord_username "sahiboh". Never
+ * throws on a leading '@' or on a query that happens to contain regex/ilike-special characters.
+ */
 export async function resolveMemberRef(query: string | null | undefined): Promise<TfMember | null> {
   if (!query) return null
-  const clean = query.trim().replace(/^@/, '')
+  const clean = query.trim().replace(/^@/, '').trim()
   if (!clean) return null
+  const escaped = escapeIlike(clean)
 
-  const { data: exact } = await supabase
+  const { data: exact, error: exactError } = await supabase
     .from('tf_members')
     .select('*')
-    .or(`name.ilike.${clean},telegram_username.ilike.${clean},discord_username.ilike.${clean}`)
+    .or(`name.ilike.${escaped},telegram_username.ilike.${escaped},discord_username.ilike.${escaped}`)
     .limit(1)
     .maybeSingle()
+  if (exactError) console.error(`resolveMemberRef exact lookup failed for "${query}":`, exactError)
   if (exact) return exact as TfMember
 
-  const { data: fuzzy } = await supabase.from('tf_members').select('*').ilike('name', `%${clean}%`).limit(1).maybeSingle()
-  return (fuzzy as TfMember) ?? null
+  const { data: fuzzy, error: fuzzyError } = await supabase
+    .from('tf_members')
+    .select('*')
+    .or(`name.ilike.%${escaped}%,telegram_username.ilike.%${escaped}%,discord_username.ilike.%${escaped}%`)
+    .limit(10)
+  if (fuzzyError) console.error(`resolveMemberRef fuzzy lookup failed for "${query}":`, fuzzyError)
+  const candidates = (fuzzy as TfMember[]) ?? []
+  if (candidates.length === 0) return null
+  if (candidates.length === 1) return candidates[0]
+
+  // Multiple substring hits — prefer one where the query is a whole word in the name
+  // or exactly matches a username, so "sahiboh" picks "Adam Sahiboh" over an unrelated
+  // partial match elsewhere.
+  const lowerClean = clean.toLowerCase()
+  const wordBoundary = new RegExp(`\\b${clean.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`, 'i')
+  const best =
+    candidates.find((m) => m.discord_username?.toLowerCase() === lowerClean || m.telegram_username?.toLowerCase() === lowerClean) ??
+    candidates.find((m) => wordBoundary.test(m.name)) ??
+    candidates[0]
+  return best
 }
 
 async function resolveTeamRef(query: string | null | undefined): Promise<TfTeam | null> {
@@ -257,7 +287,10 @@ const TOOL_DEFS: ToolDef[] = [
         .select('*')
         .single()
 
-      if (error || !created) return `Failed to create task: ${error?.message ?? 'unknown error'}`
+      if (error || !created) {
+        console.error('Failed to create task:', error)
+        return `Failed to create task: ${error?.message ?? 'unknown error'}`
+      }
 
       await logActivity(supabase, { taskId: created.id, memberId: ctx.sender?.id ?? null, action: 'created', newValue: title })
 
@@ -324,7 +357,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (Object.keys(updates).length === 0) return 'No recognized fields to update were provided.'
 
       const { error } = await supabase.from('tf_tasks').update(updates).eq('id', task.id)
-      if (error) return `Failed to update task: ${error.message}`
+      if (error) {
+        console.error(`Failed to update task:`, error)
+        return `Failed to update task: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'updated', metadata: updates })
 
@@ -349,7 +385,10 @@ const TOOL_DEFS: ToolDef[] = [
       await supabase.from('tf_task_attachments').delete().eq('task_id', task.id)
       await supabase.from('tf_task_activity').delete().eq('task_id', task.id)
       const { error } = await supabase.from('tf_tasks').delete().eq('id', task.id)
-      if (error) return `Failed to delete task: ${error.message}`
+      if (error) {
+        console.error(`Failed to delete task:`, error)
+        return `Failed to delete task: ${error.message}`
+      }
       return `Deleted task "${task.title}".`
     },
   },
@@ -373,7 +412,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!newAssignee) return `No member found matching "${assigneeName}".`
 
       const { error } = await supabase.from('tf_tasks').update({ assignee_id: newAssignee.id }).eq('id', task.id)
-      if (error) return `Failed to reassign: ${error.message}`
+      if (error) {
+        console.error(`Failed to reassign:`, error)
+        return `Failed to reassign: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'assigned', newValue: newAssignee.name })
       await notifyMemberAssigned(newAssignee, `📌 You've been assigned: "${task.title}"`)
@@ -393,7 +435,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!task) return `No task found matching "${query}".`
 
       const { error } = await supabase.from('tf_tasks').update({ status: 'done', completed_at: new Date().toISOString() }).eq('id', task.id)
-      if (error) return `Failed to complete: ${error.message}`
+      if (error) {
+        console.error(`Failed to complete:`, error)
+        return `Failed to complete: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'completed', oldValue: task.status, newValue: 'done' })
       return `Marked "${task.title}" as done.`
@@ -411,7 +456,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!task) return `No task found matching "${query}".`
 
       const { error } = await supabase.from('tf_tasks').update({ status: 'in_progress' }).eq('id', task.id)
-      if (error) return `Failed to start: ${error.message}`
+      if (error) {
+        console.error(`Failed to start:`, error)
+        return `Failed to start: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'status_changed', oldValue: task.status, newValue: 'in_progress' })
       return `Started "${task.title}" — moved to In Progress.`
@@ -419,7 +467,8 @@ const TOOL_DEFS: ToolDef[] = [
   },
   {
     name: 'list_tasks',
-    description: 'List tasks, optionally filtered by status, assignee, overdue-only, or platform.',
+    description:
+      'List tasks, optionally filtered by status, assignee, overdue-only, or platform. When assignee_name is given and no status is specified (e.g. "today\'s tasks for X", "what is X working on"), returns that member\'s ACTIVE tasks (todo + in_progress), flagging which are due today, overdue, or have no due date — it does NOT silently filter to only tasks due exactly today.',
     properties: {
       status: { type: 'string' },
       assignee_name: { type: 'string' },
@@ -433,28 +482,43 @@ const TOOL_DEFS: ToolDef[] = [
       const platform = strArg(args, 'platform')?.toLowerCase()
       if (platform) query = query.eq('platform', platform)
 
+      let member: TfMember | null = null
       const assigneeName = strArg(args, 'assignee_name')
       if (assigneeName) {
-        const member = await resolveMemberRef(assigneeName)
+        member = await resolveMemberRef(assigneeName)
         if (!member) return `No member found matching "${assigneeName}".`
         query = query.eq('assignee_id', member.id)
       }
 
+      // No explicit status filter but we do have an assignee — default to their active work
+      // (todo + in_progress) rather than dumping every task they've ever had, including "done".
+      const defaultedToActive = !status && !!member
+      if (defaultedToActive) query = query.in('status', ['todo', 'in_progress'])
+
       const { data, error } = await query.order('due_date', { ascending: true, nullsFirst: false })
-      if (error) return `Failed to list tasks: ${error.message}`
+      if (error) {
+        console.error('Failed to list tasks:', error)
+        return `Couldn't load tasks: ${error.message}`
+      }
       let list = (data ?? []) as (TfTask & { assignee: { name: string } | null })[]
 
       if (boolArg(args, 'overdue_only')) list = list.filter((t) => isOverdue(t))
 
-      if (list.length === 0) return 'No tasks match those filters.'
-      const lines = list
-        .slice(0, 30)
-        .map(
-          (t) =>
-            `#${t.id.slice(0, 8)} "${t.title}" — ${t.status}, ${t.priority}${t.assignee ? `, ${t.assignee.name}` : ''}${
-              t.due_date ? `, due ${formatDueDate(t.due_date)}` : ''
-            }${isOverdue(t) ? ' ⚠️ overdue' : ''}`
-        )
+      if (list.length === 0) {
+        if (member) return defaultedToActive ? `${member.name} has no active tasks.` : `${member.name} has no tasks matching those filters.`
+        return 'No tasks match those filters.'
+      }
+
+      const todayStr = todayLabel()
+      const lines = list.slice(0, 30).map((t) => {
+        let dueFlag = ''
+        if (!t.due_date) dueFlag = ' (no due date)'
+        else if (isOverdue(t)) dueFlag = ' ⚠️ overdue'
+        else if (t.due_date.slice(0, 10) === todayStr) dueFlag = ' 📅 due today'
+        return `#${t.id.slice(0, 8)} "${t.title}" — ${t.status}, ${t.priority}${t.assignee ? `, ${t.assignee.name}` : ''}${
+          t.due_date ? `, due ${formatDueDate(t.due_date)}` : ''
+        }${dueFlag}`
+      })
       return lines.join('\n') + (list.length > 30 ? `\n…and ${list.length - 30} more.` : '')
     },
   },
@@ -471,7 +535,10 @@ const TOOL_DEFS: ToolDef[] = [
         .select('*, assignee:tf_members(name)')
         .or(`title.ilike.%${q}%,description.ilike.%${q}%`)
         .limit(20)
-      if (error) return `Search failed: ${error.message}`
+      if (error) {
+        console.error('Task search failed:', error)
+        return `Search failed: ${error.message}`
+      }
       const list = (data ?? []) as (TfTask & { assignee: { name: string } | null })[]
       if (list.length === 0) return `No tasks matching "${q}".`
       return list.map((t) => `#${t.id.slice(0, 8)} "${t.title}" — ${t.status}${t.assignee ? `, ${t.assignee.name}` : ''}`).join('\n')
@@ -535,7 +602,10 @@ const TOOL_DEFS: ToolDef[] = [
       const { error } = await supabase
         .from('tf_task_attachments')
         .insert({ task_id: task.id, type: 'link', title: strArg(args, 'title') ?? null, url, uploaded_by: ctx.sender?.id ?? null })
-      if (error) return `Failed to add attachment: ${error.message}`
+      if (error) {
+        console.error(`Failed to add attachment:`, error)
+        return `Failed to add attachment: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'attachment_added', newValue: url })
       return `Added attachment to "${task.title}".`
@@ -580,7 +650,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!match) return `No attachment matching "${matcher}" found on "${task.title}".`
 
       const { error } = await supabase.from('tf_task_attachments').delete().eq('id', match.id)
-      if (error) return `Failed to remove attachment: ${error.message}`
+      if (error) {
+        console.error(`Failed to remove attachment:`, error)
+        return `Failed to remove attachment: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'attachment_removed', oldValue: match.url })
       return `Removed attachment "${match.title ?? match.url}" from "${task.title}".`
@@ -603,7 +676,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!task) return `No task found matching "${q}".`
 
       const { error } = await supabase.from('tf_tasks').update({ is_recurring: true, recurrence_pattern: patternRaw }).eq('id', task.id)
-      if (error) return `Failed to set recurrence: ${error.message}`
+      if (error) {
+        console.error(`Failed to set recurrence:`, error)
+        return `Failed to set recurrence: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'recurrence_set', newValue: patternRaw })
       return `"${task.title}" is now recurring (${patternRaw}).`
@@ -621,7 +697,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!task) return `No task found matching "${q}".`
 
       const { error } = await supabase.from('tf_tasks').update({ is_recurring: false, recurrence_pattern: null }).eq('id', task.id)
-      if (error) return `Failed to stop recurrence: ${error.message}`
+      if (error) {
+        console.error(`Failed to stop recurrence:`, error)
+        return `Failed to stop recurrence: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender?.id ?? null, action: 'recurrence_stopped' })
       return `Stopped recurrence on "${task.title}".`
@@ -631,15 +710,24 @@ const TOOL_DEFS: ToolDef[] = [
   // ── SELF ───────────────────────────────────────────────────────────────
   {
     name: 'list_my_tasks',
-    description: "List the current sender's own active tasks.",
+    description: "List the current sender's own active tasks (todo + in_progress), flagging which are due today, overdue, or undated.",
     properties: {},
     execute: async (_args, ctx) => {
       if (!ctx.sender) return "You're not registered yet — ask the admin to add you."
-      const { data } = await supabase.from('tf_tasks').select('*').eq('assignee_id', ctx.sender.id)
-      const active = ((data as TfTask[]) ?? []).filter((t) => t.status !== 'done')
+      const { data, error } = await supabase.from('tf_tasks').select('*').eq('assignee_id', ctx.sender.id).in('status', ['todo', 'in_progress'])
+      if (error) {
+        console.error(`Failed to load tasks for ${ctx.sender.name}:`, error)
+        return `Couldn't load your tasks: ${error.message}`
+      }
+      const active = (data as TfTask[]) ?? []
       if (active.length === 0) return 'You have no active tasks right now.'
+      const todayStr = todayLabel()
       return active
-        .map((t) => `"${t.title}" (${t.status}, ${t.priority}${t.due_date ? `, due ${formatDueDate(t.due_date)}` : ''})`)
+        .map((t) => {
+          let dueFlag = ' (no due date)'
+          if (t.due_date) dueFlag = isOverdue(t) ? ' ⚠️ overdue' : t.due_date.slice(0, 10) === todayStr ? ' 📅 due today' : ''
+          return `"${t.title}" (${t.status}, ${t.priority}${t.due_date ? `, due ${formatDueDate(t.due_date)}` : ''})${dueFlag}`
+        })
         .join('\n')
     },
   },
@@ -657,7 +745,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (task.assignee_id !== ctx.sender.id) return 'That task is assigned to someone else — you can only complete your own tasks.'
 
       const { error } = await supabase.from('tf_tasks').update({ status: 'done', completed_at: new Date().toISOString() }).eq('id', task.id)
-      if (error) return `Failed to complete: ${error.message}`
+      if (error) {
+        console.error(`Failed to complete:`, error)
+        return `Failed to complete: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender.id, action: 'completed', oldValue: task.status, newValue: 'done' })
       return `Marked "${task.title}" as done.`
@@ -677,7 +768,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (task.assignee_id !== ctx.sender.id) return 'That task is assigned to someone else — you can only start your own tasks.'
 
       const { error } = await supabase.from('tf_tasks').update({ status: 'in_progress' }).eq('id', task.id)
-      if (error) return `Failed to start: ${error.message}`
+      if (error) {
+        console.error(`Failed to start:`, error)
+        return `Failed to start: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender.id, action: 'status_changed', oldValue: task.status, newValue: 'in_progress' })
       return `Started "${task.title}" — moved to In Progress.`
@@ -697,7 +791,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (task.assignee_id !== ctx.sender.id) return 'That task is assigned to someone else — you can only pause your own tasks.'
 
       const { error } = await supabase.from('tf_tasks').update({ status: 'todo' }).eq('id', task.id)
-      if (error) return `Failed to pause: ${error.message}`
+      if (error) {
+        console.error(`Failed to pause:`, error)
+        return `Failed to pause: ${error.message}`
+      }
 
       await logActivity(supabase, { taskId: task.id, memberId: ctx.sender.id, action: 'status_changed', oldValue: task.status, newValue: 'todo' })
       return `Paused "${task.title}" — moved back to To Do.`
@@ -718,12 +815,19 @@ const TOOL_DEFS: ToolDef[] = [
   },
   {
     name: 'my_workload',
-    description: "Show the current sender's own workload (booked vs max hours, active tasks).",
+    description: "Show the current sender's own workload (booked vs max hours, active tasks, free time).",
     properties: {},
     execute: async (_args, ctx) => {
       if (!ctx.sender) return "You're not registered yet — ask the admin to add you."
-      const w = await getMemberWorkload(ctx.sender.id)
-      return `You have ${w.active_tasks} active task(s), ${w.estimated_hours_remaining}h booked of ${w.max_daily_hours}h/day (${w.utilization_pct}% utilized, ${w.status}). ${w.available_hours}h available.`
+      let w
+      try {
+        w = await getMemberWorkload(ctx.sender.id)
+      } catch (err) {
+        console.error(`Failed to load workload for ${ctx.sender.name}:`, err)
+        return `Couldn't load your workload: ${err instanceof Error ? err.message : String(err)}`
+      }
+      const estimateNote = w.tasks_without_estimate > 0 ? ` (${w.tasks_without_estimate} of them have no time estimate, so this is a floor)` : ''
+      return `You have ${w.active_tasks} active task(s)${estimateNote}, ${w.estimated_hours_remaining}h booked of ${w.max_daily_hours}h/day (${w.utilization_pct}% utilized, ${w.status}). ${w.available_hours}h available.`
     },
   },
 
@@ -752,7 +856,10 @@ const TOOL_DEFS: ToolDef[] = [
         .insert({ name, telegram_username: telegramUsername ?? null, discord_username: discordUsername ?? null, role: 'worker', status: 'active' })
         .select('*')
         .single()
-      if (error || !newMember) return `Failed to create member: ${error?.message ?? 'unknown error'}`
+      if (error || !newMember) {
+        console.error('Failed to create member:', error)
+        return `Failed to create member: ${error?.message ?? 'unknown error'}`
+      }
 
       const teamName = strArg(args, 'team_name')
       if (teamName) {
@@ -803,7 +910,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (Object.keys(updates).length === 0) return 'No recognized fields to update were provided.'
 
       const { error } = await supabase.from('tf_members').update(updates).eq('id', member.id)
-      if (error) return `Failed to update member: ${error.message}`
+      if (error) {
+        console.error(`Failed to update member:`, error)
+        return `Failed to update member: ${error.message}`
+      }
       return `Updated ${member.name} (${Object.keys(updates).join(', ')}).`
     },
   },
@@ -817,9 +927,9 @@ const TOOL_DEFS: ToolDef[] = [
       return ctxData.members
         .map(
           (m) =>
-            `${m.name} (${m.role}, ${m.status}) — ${m.active_task_count} active task(s), ${m.hours_booked}h booked, teams: ${
-              m.teams.join(', ') || 'none'
-            }, skills: ${m.skills.join(', ') || 'none'}`
+            `${m.name} (${m.role}, ${m.status}) — ${m.active_task_count} active task(s), ${m.hours_booked}h booked${
+              m.tasks_without_estimate > 0 ? ` (${m.tasks_without_estimate} without a time estimate)` : ''
+            }, teams: ${m.teams.join(', ') || 'none'}, skills: ${m.skills.join(', ') || 'none'}`
         )
         .join('\n')
     },
@@ -845,7 +955,9 @@ const TOOL_DEFS: ToolDef[] = [
         }`,
         `Teams: ${found.teams.join(', ') || 'none'}`,
         `Skills: ${found.skills.join(', ') || 'none'}`,
-        `Active tasks: ${found.active_task_count}, ${found.hours_booked}h/${found.max_daily_hours}h booked`,
+        `Active tasks: ${found.active_task_count}, ${found.hours_booked}h/${found.max_daily_hours}h booked${
+          found.tasks_without_estimate > 0 ? ` (${found.tasks_without_estimate} without a time estimate)` : ''
+        }`,
       ].join('\n')
     },
   },
@@ -872,7 +984,10 @@ const TOOL_DEFS: ToolDef[] = [
       const { error } = await supabase
         .from('tf_member_skills')
         .upsert({ member_id: member.id, skill_id: skill.id, proficiency_level: proficiency }, { onConflict: 'member_id,skill_id' })
-      if (error) return `Failed to assign skill: ${error.message}`
+      if (error) {
+        console.error(`Failed to assign skill:`, error)
+        return `Failed to assign skill: ${error.message}`
+      }
       return `Assigned ${skill.name} (${proficiency}/5) to ${member.name}.`
     },
   },
@@ -892,7 +1007,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!skill) return `No skill found matching "${skillName}".`
 
       const { error } = await supabase.from('tf_member_skills').delete().eq('member_id', member.id).eq('skill_id', skill.id)
-      if (error) return `Failed to remove skill: ${error.message}`
+      if (error) {
+        console.error(`Failed to remove skill:`, error)
+        return `Failed to remove skill: ${error.message}`
+      }
       return `Removed ${skill.name} from ${member.name}.`
     },
   },
@@ -910,7 +1028,10 @@ const TOOL_DEFS: ToolDef[] = [
       const { error } = await supabase
         .from('tf_skills')
         .insert({ name, description: strArg(args, 'description') ?? null, category: strArg(args, 'category') ?? 'general' })
-      if (error) return `Failed to create skill: ${error.message}`
+      if (error) {
+        console.error(`Failed to create skill:`, error)
+        return `Failed to create skill: ${error.message}`
+      }
       return `Created skill "${name}".`
     },
   },
@@ -938,6 +1059,7 @@ const TOOL_DEFS: ToolDef[] = [
       const { error } = await supabase.from('tf_teams').insert({ name: teamName, description: strArg(args, 'description') ?? null })
       if (error) {
         if ((error as { code?: string }).code === '23505') return `Team "${teamName}" already exists.`
+        console.error('Failed to create team:', error)
         return `Failed to create team: ${error.message}`
       }
       return `Created team "${teamName}".`
@@ -961,6 +1083,7 @@ const TOOL_DEFS: ToolDef[] = [
       const { error } = await supabase.from('tf_member_teams').insert({ member_id: member.id, team_id: team.id })
       if (error) {
         if ((error as { code?: string }).code === '23505') return `${member.name} is already on the "${team.name}" team.`
+        console.error('Failed to add member to team:', error)
         return `Failed to add member to team: ${error.message}`
       }
       const granted = await autoGrantPlatformTopic(team)
@@ -983,7 +1106,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!team) return `No team found matching "${teamName}".`
 
       const { error } = await supabase.from('tf_member_teams').delete().eq('member_id', member.id).eq('team_id', team.id)
-      if (error) return `Failed to remove member from team: ${error.message}`
+      if (error) {
+        console.error(`Failed to remove member from team:`, error)
+        return `Failed to remove member from team: ${error.message}`
+      }
       return `Removed ${member.name} from "${team.name}".`
     },
   },
@@ -1013,7 +1139,10 @@ const TOOL_DEFS: ToolDef[] = [
       const { error } = await supabase
         .from('tf_topic_team_access')
         .upsert({ topic_name: topicName.toLowerCase(), team_id: team.id }, { onConflict: 'topic_name,team_id' })
-      if (error) return `Failed to grant access: ${error.message}`
+      if (error) {
+        console.error(`Failed to grant access:`, error)
+        return `Failed to grant access: ${error.message}`
+      }
 
       await announceTopicAccessGranted(topicName.toLowerCase(), team.name)
       return `Granted "${team.name}" access to the ${topicName} topic.`
@@ -1033,7 +1162,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (!team) return `No team found matching "${teamName}".`
 
       const { error } = await supabase.from('tf_topic_team_access').delete().eq('topic_name', topicName.toLowerCase()).eq('team_id', team.id)
-      if (error) return `Failed to revoke access: ${error.message}`
+      if (error) {
+        console.error(`Failed to revoke access:`, error)
+        return `Failed to revoke access: ${error.message}`
+      }
       return `Revoked "${team.name}"'s access to the ${topicName} topic.`
     },
   },
@@ -1061,7 +1193,10 @@ const TOOL_DEFS: ToolDef[] = [
       if (existing) return `Board "${name}" already exists.`
 
       const { error } = await supabase.from('tf_boards').insert({ name, description: strArg(args, 'description') ?? null })
-      if (error) return `Failed to create board: ${error.message}`
+      if (error) {
+        console.error(`Failed to create board:`, error)
+        return `Failed to create board: ${error.message}`
+      }
       return `Created board "${name}".`
     },
   },
@@ -1257,13 +1392,22 @@ const TOOL_DEFS: ToolDef[] = [
   // ── INSIGHT ────────────────────────────────────────────────────────────
   {
     name: 'team_workload',
-    description: 'Show every active member\'s booked vs max daily hours and active task count.',
+    description: 'Show every active member\'s booked vs max daily hours, active task count, and free time.',
     properties: {},
     execute: async () => {
-      const workloads = await getTeamWorkload()
+      let workloads
+      try {
+        workloads = await getTeamWorkload()
+      } catch (err) {
+        console.error('Failed to load team workload:', err)
+        return `Couldn't load team workload: ${err instanceof Error ? err.message : String(err)}`
+      }
       if (workloads.length === 0) return 'No active members found.'
       return workloads
-        .map((w) => `${w.name}: ${w.estimated_hours_remaining}h/${w.max_daily_hours}h booked (${w.utilization_pct}%, ${w.status}), ${w.active_tasks} active task(s)`)
+        .map((w) => {
+          const estimateNote = w.tasks_without_estimate > 0 ? `, ${w.tasks_without_estimate} without a time estimate` : ''
+          return `${w.name}: ${w.estimated_hours_remaining}h/${w.max_daily_hours}h booked (${w.utilization_pct}%, ${w.status}), ${w.active_tasks} active task(s)${estimateNote}, ${w.available_hours}h free`
+        })
         .join('\n')
     },
   },
@@ -1273,7 +1417,13 @@ const TOOL_DEFS: ToolDef[] = [
     properties: { skill_name: { type: 'string' }, date: { type: 'string', description: 'Not currently used for scheduling — informational only' } },
     execute: async (args) => {
       const skillName = strArg(args, 'skill_name')
-      const candidates = await findBestAssignee(skillName)
+      let candidates
+      try {
+        candidates = await findBestAssignee(skillName)
+      } catch (err) {
+        console.error('Failed to find best assignee:', err)
+        return `Couldn't determine who's free: ${err instanceof Error ? err.message : String(err)}`
+      }
       if (candidates.length === 0) return skillName ? `No available members with the "${skillName}" skill.` : 'No available members found.'
       return candidates.map((c) => `${c.name} — ${c.reason} (score ${c.recommendation_score})`).join('\n')
     },
@@ -1363,7 +1513,10 @@ const TOOL_DEFS: ToolDef[] = [
         posted_at: nowIso,
         status: 'posted',
       })
-      if (postError) return `Failed to log the post: ${postError.message}`
+      if (postError) {
+        console.error('Failed to log reel post:', postError)
+        return `Failed to log the post: ${postError.message}`
+      }
 
       const { data: candidateTasks } = await supabase.from('tf_tasks').select('*').ilike('title', `%${handle}%`)
       const recurringTask = ((candidateTasks as TfTask[]) ?? []).find(
@@ -1474,7 +1627,10 @@ const TOOL_DEFS: ToolDef[] = [
         proxy_username: strArg(args, 'proxy_username') ?? null,
         proxy_password: strArg(args, 'proxy_password') ?? null,
       })
-      if (error) return `Failed to add vault item: ${error.message}`
+      if (error) {
+        console.error(`Failed to add vault item:`, error)
+        return `Failed to add vault item: ${error.message}`
+      }
       return `Added "${name}" to ${member.name}'s vault.`
     },
   },

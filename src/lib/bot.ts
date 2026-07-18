@@ -63,6 +63,30 @@ function reply(ctx: Context, text: string, extra?: Parameters<Context['reply']>[
   })
 }
 
+const REPLY_CONTEXT_MAX_CHARS = 300
+
+/**
+ * When the incoming message is itself a reply (reply_to_message), prior conversation history
+ * alone isn't enough context for follow-ups like "did you mark it as done?" — the assistant
+ * needs to know what "it" refers to. Prepends the referenced message's text/caption (truncated)
+ * so runAssistant sees it as part of the current turn.
+ */
+function buildReplyContextPrefix(ctx: Context): string {
+  const message = ctx.message
+  const replied = message && 'reply_to_message' in message ? message.reply_to_message : undefined
+  if (!replied) return ''
+  const content =
+    'text' in replied && typeof replied.text === 'string'
+      ? replied.text
+      : 'caption' in replied && typeof replied.caption === 'string'
+        ? replied.caption
+        : undefined
+  const trimmed = content?.trim()
+  if (!trimmed) return ''
+  const truncated = trimmed.length > REPLY_CONTEXT_MAX_CHARS ? `${trimmed.slice(0, REPLY_CONTEXT_MAX_CHARS)}…` : trimmed
+  return `[Replying to your earlier message: "${truncated}"]\n`
+}
+
 // ---------------------------------------------------------------------------
 // telegram_id + username capture — runs FIRST, before any gating or command
 // handler, for every incoming update (private chat, group, callback query —
@@ -928,11 +952,14 @@ bot.command('who', async (ctx) => {
     const member = r.member as TfMember
     const memberTasks = activeTasks.filter((t) => t.assignee_id === member.id)
     const bookedHours = memberTasks.reduce((sum, t) => sum + (t.estimated_hours ?? 0), 0)
+    const unestimated = memberTasks.filter((t) => t.estimated_hours == null).length
     const capacity = member.max_daily_hours - bookedHours
     return {
       member,
       proficiency: r.proficiency_level,
       bookedHours,
+      taskCount: memberTasks.length,
+      unestimated,
       capacity,
       available: bookedHours < member.max_daily_hours,
     }
@@ -942,7 +969,8 @@ bot.command('who', async (ctx) => {
 
   const lines = results.map((r, i) => {
     const status = r.available ? 'AVAILABLE' : 'BUSY'
-    return `${i + 1}. ${r.member.name} — ${r.bookedHours}/${r.member.max_daily_hours}h booked today (${status})\n   Proficiency: ${r.proficiency}/5`
+    const estimateNote = r.unestimated > 0 ? `, ${r.unestimated} without a time estimate` : ''
+    return `${i + 1}. ${r.member.name} — ${r.bookedHours}/${r.member.max_daily_hours}h booked today (${status}), ${r.taskCount} active task(s)${estimateNote}\n   Proficiency: ${r.proficiency}/5`
   })
 
   const top = results[0]
@@ -1611,7 +1639,14 @@ bot.command('myworkload', async (ctx) => {
     return
   }
 
-  const workload = await getMemberWorkload(member.id)
+  let workload
+  try {
+    workload = await getMemberWorkload(member.id)
+  } catch (err) {
+    console.error(`Failed to load workload for ${member.name}:`, err)
+    await reply(ctx, `Couldn't load your workload: ${err instanceof Error ? err.message : String(err)}`)
+    return
+  }
   const statusEmoji: Record<string, string> = {
     available: '🟢',
     moderate: '🟡',
@@ -1622,7 +1657,9 @@ bot.command('myworkload', async (ctx) => {
   await reply(
     ctx,
     `${statusEmoji[workload.status]} Your workload: ${workload.status}\n\n` +
-      `Active tasks: ${workload.active_tasks}\n` +
+      `Active tasks: ${workload.active_tasks}${
+        workload.tasks_without_estimate > 0 ? ` (${workload.tasks_without_estimate} without a time estimate)` : ''
+      }\n` +
       `Hours remaining: ${workload.estimated_hours_remaining}h / ${workload.max_daily_hours}h (${workload.utilization_pct}%)\n` +
       `Available capacity: ${workload.available_hours}h`
   )
@@ -2113,8 +2150,9 @@ bot.on('text', async (ctx) => {
   if (await tryHandleReelLinkAutoLog(ctx, text, sender, admin)) return
 
   await ctx.sendChatAction('typing')
+  const replyPrefix = buildReplyContextPrefix(ctx)
   const aiReply = await runAssistant({
-    text,
+    text: `${replyPrefix}${text}`,
     channel: 'telegram',
     chatKey: chatKeyFor(ctx),
     sender,

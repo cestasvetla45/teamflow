@@ -32,20 +32,31 @@ export async function loadConversation(channel: string, chatKey: string): Promis
       .eq('chat_key', chatKey)
       .maybeSingle()
 
-    if (error || !data) return []
+    if (error) {
+      console.error(`Failed to load conversation memory for ${chatKey}:`, error)
+      return []
+    }
+    if (!data) return []
     const messages = data.messages as GeminiContent[] | null
     if (!Array.isArray(messages)) return []
     return messages.slice(-MAX_STORED_TURNS)
   } catch (err) {
-    console.error('Failed to load conversation memory:', err)
+    console.error(`Failed to load conversation memory for ${chatKey}:`, err)
     return []
   }
 }
 
+/**
+ * Persists the conversation turns for this chat. MUST be awaited by the caller — history is
+ * only useful for the next turn's context (follow-ups like "did you mark it done?") if the
+ * write actually lands before the next request reads it. Any failure (thrown error or a
+ * Supabase-returned error object, which does NOT throw) is logged in full so silent memory
+ * loss is visible in the logs instead of just manifesting as "the bot forgot".
+ */
 export async function saveConversation(channel: string, chatKey: string, contents: GeminiContent[]): Promise<void> {
   try {
     const trimmed = sanitizeContentsForStorage(contents)
-    await supabase.from('tf_conversations').upsert(
+    const { error } = await supabase.from('tf_conversations').upsert(
       {
         channel,
         chat_key: chatKey,
@@ -54,7 +65,10 @@ export async function saveConversation(channel: string, chatKey: string, content
       },
       { onConflict: 'chat_key' }
     )
+    if (error) {
+      console.error(`Failed to save conversation memory for ${chatKey}:`, error)
+    }
   } catch (err) {
-    console.error('Failed to save conversation memory:', err)
+    console.error(`Failed to save conversation memory for ${chatKey}:`, err)
   }
 }
