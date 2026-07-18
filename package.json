@@ -42,5 +42,8 @@
     "tailwindcss": "^3.4.1",
     "tsc-alias": "^1.9.1",
     "typescript": "^5"
+  },
+  "engines": {
+    "node": ">=22"
   }
 }

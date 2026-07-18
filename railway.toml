@@ -1,3 +1,6 @@
+[build]
+buildCommand = "npm run build:all"
+
 [deploy]
 startCommand = "./start.sh"
 restartPolicyType = "ON_FAILURE"
